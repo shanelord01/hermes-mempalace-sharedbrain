@@ -65,6 +65,283 @@ def _read_config(hermes_home: str) -> Dict[str, Any]:
         return {}
 
 
+# Always available -- read-only or self-contained (own diary), safe by default.
+_BASE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    {
+        "name": "mempalace_search",
+        "description": "Search the shared MemPalace memory (verbatim results, semantic search).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Search keywords or a question (max 250 chars)"},
+                "limit": {"type": "integer", "description": "Max results (default 5)"},
+            },
+            "required": ["query"],
+        },
+    },
+    {
+        "name": "mempalace_add_drawer",
+        "description": "File a durable fact or decision verbatim into the shared MemPalace memory.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Verbatim content to store"},
+                "room": {
+                    "type": "string",
+                    "description": "Category, e.g. decisions, facts (optional, defaults to conversation)",
+                },
+            },
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "mempalace_list_drawers",
+        "description": (
+            "List drawers with pagination -- a reliable completeness check that doesn't depend "
+            "on semantic similarity the way mempalace_search does. Use this when you need to "
+            "confirm what's actually filed under a wing/room, not just what a query surfaces."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "room": {"type": "string", "description": "Filter by room (optional)"},
+                "limit": {"type": "integer", "description": "Max results per page (default 20, max 100)"},
+                "offset": {"type": "integer", "description": "Offset for pagination (default 0)"},
+            },
+        },
+    },
+    {
+        "name": "mempalace_status",
+        "description": (
+            "Palace overview: total drawers, wing/room counts, and the hub's own memory protocol "
+            "reminder. Call this at the start of a session for orientation."
+        ),
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "mempalace_get_taxonomy",
+        "description": "Full taxonomy: wing -> room -> drawer count, across the whole palace.",
+        "parameters": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "mempalace_kg_query",
+        "description": (
+            "Query the knowledge graph for an entity's relationships -- typed facts with temporal "
+            "validity (e.g. 'Max' -> child_of Alice, loves chess). Use for relational/temporal "
+            "facts search alone won't reliably surface. Read-only."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "entity": {"type": "string", "description": "Entity to query (e.g. a person or project name)"},
+                "as_of": {"type": "string", "description": "Date/datetime filter (optional)"},
+                "direction": {
+                    "type": "string",
+                    "description": "outgoing (entity->?), incoming (?->entity), or both (default: both)",
+                },
+            },
+            "required": ["entity"],
+        },
+    },
+    {
+        "name": "mempalace_get_drawer",
+        "description": "Fetch one drawer's full content by its drawer_id (e.g. to follow up on a search result).",
+        "parameters": {
+            "type": "object",
+            "properties": {"drawer_id": {"type": "string", "description": "The drawer_id to fetch"}},
+            "required": ["drawer_id"],
+        },
+    },
+    {
+        "name": "mempalace_diary_write",
+        "description": (
+            "Write a session diary entry: what happened, what was learned, what matters. The "
+            "hub's own protocol calls for this after each session, separate from filing drawers. "
+            "Writes to this agent's own diary only."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {"content": {"type": "string", "description": "Diary entry content"}},
+            "required": ["content"],
+        },
+    },
+    {
+        "name": "mempalace_diary_read",
+        "description": "Read back this agent's own recent diary entries.",
+        "parameters": {
+            "type": "object",
+            "properties": {"limit": {"type": "integer", "description": "Max entries (optional)"}},
+        },
+    },
+]
+
+# Opt-in: mutates the shared knowledge graph other agents rely on for entity facts.
+# Gated behind enable_kg_write (default False) -- see get_config_schema().
+_KG_WRITE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    {
+        "name": "mempalace_kg_add",
+        "description": (
+            "Add a fact to the shared knowledge graph: subject -> predicate -> object, with an "
+            "optional time window."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "The entity doing/being something"},
+                "predicate": {"type": "string", "description": "The relationship type, e.g. 'works_on'"},
+                "object": {"type": "string", "description": "The entity being connected to"},
+                "valid_from": {"type": "string", "description": "When this became true (optional)"},
+                "valid_to": {"type": "string", "description": "When this stopped being true (optional)"},
+            },
+            "required": ["subject", "predicate", "object"],
+        },
+    },
+    {
+        "name": "mempalace_kg_invalidate",
+        "description": "Mark a shared knowledge-graph fact as no longer true (e.g. a job or project ended).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "Entity"},
+                "predicate": {"type": "string", "description": "Relationship"},
+                "object": {"type": "string", "description": "Connected entity"},
+                "ended": {"type": "string", "description": "When it stopped being true (optional, default: today)"},
+            },
+            "required": ["subject", "predicate", "object"],
+        },
+    },
+    {
+        "name": "mempalace_kg_supersede",
+        "description": (
+            "Atomically replace a shared fact with its successor (e.g. model, employer, address "
+            "changed). Prefer this over separate kg_invalidate + kg_add for single-valued facts."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "subject": {"type": "string", "description": "The entity whose fact is changing"},
+                "predicate": {"type": "string", "description": "The relationship type"},
+                "old_object": {"type": "string", "description": "The value being replaced"},
+                "new_object": {"type": "string", "description": "The new value"},
+            },
+            "required": ["subject", "predicate", "old_object", "new_object"],
+        },
+    },
+]
+
+# Opt-in: lets this agent send/receive delegated tasks and code patches to/from other
+# agents on the shared brain. Gated behind enable_coordination (default False) -- see
+# get_config_schema(). This is the consequential one: an agent with this enabled can
+# be handed work autonomously via the logstream, not just recall/file memory.
+_COORDINATION_TOOL_SCHEMAS: List[Dict[str, Any]] = [
+    {
+        "name": "mempalace_event_append",
+        "description": (
+            "Append a coordination event (e.g. task.request, task.reply, patch.ready) to the "
+            "shared agent logstream. Use to delegate work to another agent or reply to a request."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "type": {"type": "string", "description": "Event type, e.g. 'task.request', 'task.reply'"},
+                "stream": {"type": "string", "description": "Logical stream, e.g. 'project/myapp'"},
+                "room": {"type": "string", "description": "Sub-channel, e.g. 'delegation', 'patches'"},
+                "to_agent": {"type": "string", "description": "Target agent, or '*' for broadcast (optional)"},
+                "correlation_id": {"type": "string", "description": "Ties a request to its reply (optional)"},
+                "status": {
+                    "type": "string",
+                    "description": "One of: open, claimed, ready, applied, blocked, failed, superseded (optional)",
+                },
+                "body": {"type": "string", "description": "Verbatim human-readable content (optional)"},
+            },
+            "required": ["type", "stream", "room"],
+        },
+    },
+    {
+        "name": "mempalace_event_list",
+        "description": "List coordination events, e.g. check this agent's inbox for delegated tasks.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "description": "Filter by stream (optional)"},
+                "to_agent": {"type": "string", "description": "Filter by target agent (optional)"},
+                "correlation_id": {"type": "string", "description": "Filter by correlation id (optional)"},
+                "since_event_id": {"type": "string", "description": "Only events after this id (optional)"},
+                "limit": {"type": "integer", "description": "Max events to return (default 50)"},
+            },
+        },
+    },
+    {
+        "name": "mempalace_event_wait",
+        "description": "Block until a matching coordination event exists or the timeout expires (max 5 minutes).",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stream": {"type": "string", "description": "Filter by stream (optional)"},
+                "to_agent": {"type": "string", "description": "Filter by target agent (optional)"},
+                "correlation_id": {"type": "string", "description": "Filter by correlation id (optional)"},
+                "timeout_ms": {"type": "integer", "description": "Max wait in ms (default 60000, max 300000)"},
+            },
+        },
+    },
+    {
+        "name": "mempalace_event_ack",
+        "description": "Acknowledge a coordination event (e.g. claimed/applied/blocked/failed) back to its writer.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "event_id": {"type": "string", "description": "Id of the event to acknowledge"},
+                "status": {
+                    "type": "string",
+                    "description": "One of: open, claimed, ready, applied, blocked, failed, superseded (optional)",
+                },
+                "body": {"type": "string", "description": "Verbatim ack notes (optional)"},
+            },
+            "required": ["event_id"],
+        },
+    },
+    {
+        "name": "mempalace_artifact_put",
+        "description": "Store exact artifact content (patch, file, log, json, note) for a handoff to another agent.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "kind": {"type": "string", "description": "One of: patch, file, log, json, note"},
+                "content": {"type": "string", "description": "Exact artifact content"},
+            },
+            "required": ["kind", "content"],
+        },
+    },
+    {
+        "name": "mempalace_artifact_get",
+        "description": "Fetch a coordination artifact by id -- exact content plus sha256 for verification.",
+        "parameters": {
+            "type": "object",
+            "properties": {"artifact_id": {"type": "string", "description": "Artifact id to fetch"}},
+            "required": ["artifact_id"],
+        },
+    },
+    {
+        "name": "mempalace_patch_submit",
+        "description": "Store a patch artifact and append its patch.ready event in one call -- hand completed work to another agent.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "content": {"type": "string", "description": "Unified diff content"},
+                "stream": {"type": "string", "description": "Logical stream, e.g. 'project/myapp'"},
+                "to_agent": {"type": "string", "description": "Target agent or '*' (optional)"},
+                "correlation_id": {"type": "string", "description": "Ties this patch to its request (optional)"},
+                "body": {"type": "string", "description": "Verbatim notes (optional)"},
+            },
+            "required": ["content", "stream"],
+        },
+    },
+]
+
+_KG_WRITE_TOOL_NAMES = {schema["name"] for schema in _KG_WRITE_TOOL_SCHEMAS}
+_COORDINATION_TOOL_NAMES = {schema["name"] for schema in _COORDINATION_TOOL_SCHEMAS}
+
+
 class MempalaceSharedBrainProvider(MemoryProvider):
     """Hermes memory provider backed by a remote MemPalace shared-brain hub."""
 
@@ -78,6 +355,8 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         self._agent_id = "hermes"
         self._wing = _DEFAULT_WING
         self._room = _DEFAULT_ROOM
+        self._enable_kg_write = False
+        self._enable_coordination = False
         self._active = False
         self._prefetch_cache: Dict[str, str] = {}
         self._write_queue: "queue.Queue[Dict[str, str]]" = queue.Queue(maxsize=_QUEUE_MAXSIZE)
@@ -95,13 +374,17 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         self._agent_id = cfg.get("agent_id") or env_agent or "hermes"
         self._wing = cfg.get("wing") or _DEFAULT_WING
         self._room = cfg.get("room") or _DEFAULT_ROOM
+        self._enable_kg_write = bool(cfg.get("enable_kg_write", False))
+        self._enable_coordination = bool(cfg.get("enable_coordination", False))
         self._token = os.environ.get("MEMPALACE_MCP_HTTP_TOKEN", "").strip()
+
+    def _current_hermes_home(self) -> str:
+        return os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
 
     # -- ABC: core lifecycle ----------------------------------------------------
 
     def is_available(self) -> bool:
-        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-        self._resolve_config(hermes_home)
+        self._resolve_config(self._current_hermes_home())
         return bool(self._hub_url and self._token)
 
     def initialize(self, session_id: str, **kwargs) -> None:
@@ -172,39 +455,16 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         # set inside initialize()) means the dispatcher never learns these tool names
         # exist, and every call then fails as "Unknown tool" without ever reaching
         # handle_tool_call. Schemas describe the interface, not runtime readiness --
-        # readiness is checked inside handle_tool_call instead.
-        return [
-            {
-                "name": "mempalace_search",
-                "description": "Search the shared MemPalace memory (verbatim results, semantic search).",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "query": {
-                            "type": "string",
-                            "description": "Search keywords or a question (max 250 chars)",
-                        },
-                        "limit": {"type": "integer", "description": "Max results (default 5)"},
-                    },
-                    "required": ["query"],
-                },
-            },
-            {
-                "name": "mempalace_add_drawer",
-                "description": "File a durable fact or decision verbatim into the shared MemPalace memory.",
-                "parameters": {
-                    "type": "object",
-                    "properties": {
-                        "content": {"type": "string", "description": "Verbatim content to store"},
-                        "room": {
-                            "type": "string",
-                            "description": "Category, e.g. decisions, facts (optional, defaults to conversation)",
-                        },
-                    },
-                    "required": ["content"],
-                },
-            },
-        ]
+        # readiness is checked inside handle_tool_call instead. For the same reason,
+        # resolve config fresh here rather than trusting self._enable_* to already be
+        # set -- this method can run before initialize() ever does.
+        self._resolve_config(self._current_hermes_home())
+        schemas = list(_BASE_TOOL_SCHEMAS)
+        if self._enable_kg_write:
+            schemas.extend(_KG_WRITE_TOOL_SCHEMAS)
+        if self._enable_coordination:
+            schemas.extend(_COORDINATION_TOOL_SCHEMAS)
+        return schemas
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
         if not self._active:
@@ -228,7 +488,134 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                 },
             )
             return json.dumps(self._unwrap(result))
+        if tool_name == "mempalace_list_drawers":
+            result = self._call_tool(
+                "mempalace_list_drawers",
+                {
+                    "wing": self._wing,
+                    "room": args.get("room"),
+                    "limit": args.get("limit", 20),
+                    "offset": args.get("offset", 0),
+                },
+            )
+            return json.dumps(self._unwrap(result))
+        if tool_name == "mempalace_status":
+            return json.dumps(self._unwrap(self._call_tool("mempalace_status", {})))
+        if tool_name == "mempalace_get_taxonomy":
+            return json.dumps(self._unwrap(self._call_tool("mempalace_get_taxonomy", {})))
+        if tool_name == "mempalace_kg_query":
+            result = self._call_tool(
+                "mempalace_kg_query",
+                {
+                    "entity": str(args.get("entity", "")),
+                    "as_of": args.get("as_of"),
+                    "direction": args.get("direction"),
+                },
+            )
+            return json.dumps(self._unwrap(result))
+        if tool_name == "mempalace_get_drawer":
+            result = self._call_tool("mempalace_get_drawer", {"drawer_id": str(args.get("drawer_id", ""))})
+            return json.dumps(self._unwrap(result))
+        if tool_name == "mempalace_diary_write":
+            result = self._call_tool(
+                "mempalace_diary_write",
+                {"agent_name": self._agent_id, "entry": str(args.get("content", ""))},
+            )
+            return json.dumps(self._unwrap(result))
+        if tool_name == "mempalace_diary_read":
+            result = self._call_tool(
+                "mempalace_diary_read",
+                {"agent_name": self._agent_id, "last_n": args.get("limit", 10)},
+            )
+            return json.dumps(self._unwrap(result))
+
+        if tool_name in _KG_WRITE_TOOL_NAMES:
+            if not self._enable_kg_write:
+                return json.dumps({"error": f"{tool_name} requires enable_kg_write: true in config."})
+            return json.dumps(self._unwrap(self._call_tool(tool_name, self._kg_write_args(tool_name, args))))
+
+        if tool_name in _COORDINATION_TOOL_NAMES:
+            if not self._enable_coordination:
+                return json.dumps({"error": f"{tool_name} requires enable_coordination: true in config."})
+            return json.dumps(self._unwrap(self._call_tool(tool_name, self._coordination_args(tool_name, args))))
+
         raise NotImplementedError(f"Provider {self.name} does not handle tool {tool_name}")
+
+    def _kg_write_args(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        if tool_name == "mempalace_kg_add":
+            return {
+                "subject": str(args.get("subject", "")),
+                "predicate": str(args.get("predicate", "")),
+                "object": str(args.get("object", "")),
+                "valid_from": args.get("valid_from"),
+                "valid_to": args.get("valid_to"),
+            }
+        if tool_name == "mempalace_kg_invalidate":
+            return {
+                "subject": str(args.get("subject", "")),
+                "predicate": str(args.get("predicate", "")),
+                "object": str(args.get("object", "")),
+                "ended": args.get("ended"),
+            }
+        # mempalace_kg_supersede
+        return {
+            "subject": str(args.get("subject", "")),
+            "predicate": str(args.get("predicate", "")),
+            "old_object": str(args.get("old_object", "")),
+            "new_object": str(args.get("new_object", "")),
+        }
+
+    def _coordination_args(self, tool_name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+        if tool_name == "mempalace_event_append":
+            return {
+                "type": str(args.get("type", "")),
+                "stream": str(args.get("stream", "")),
+                "room": str(args.get("room", "")),
+                "from_agent": self._agent_id,
+                "to_agent": args.get("to_agent"),
+                "correlation_id": args.get("correlation_id"),
+                "status": args.get("status"),
+                "body": args.get("body"),
+            }
+        if tool_name == "mempalace_event_list":
+            return {
+                "stream": args.get("stream"),
+                "to_agent": args.get("to_agent"),
+                "correlation_id": args.get("correlation_id"),
+                "since_event_id": args.get("since_event_id"),
+                "limit": args.get("limit", 50),
+            }
+        if tool_name == "mempalace_event_wait":
+            return {
+                "stream": args.get("stream"),
+                "to_agent": args.get("to_agent"),
+                "correlation_id": args.get("correlation_id"),
+                "timeout_ms": args.get("timeout_ms", 60000),
+            }
+        if tool_name == "mempalace_event_ack":
+            return {
+                "event_id": str(args.get("event_id", "")),
+                "from_agent": self._agent_id,
+                "status": args.get("status"),
+                "body": args.get("body"),
+            }
+        if tool_name == "mempalace_artifact_put":
+            return {
+                "kind": str(args.get("kind", "")),
+                "content": str(args.get("content", "")),
+                "created_by": self._agent_id,
+            }
+        if tool_name == "mempalace_artifact_get":
+            return {"artifact_id": str(args.get("artifact_id", ""))}
+        # mempalace_patch_submit
+        return {
+            "content": str(args.get("content", "")),
+            "from_agent": self._agent_id,
+            "stream": str(args.get("stream", "")),
+            "to_agent": args.get("to_agent"),
+            "correlation_id": args.get("correlation_id"),
+            "body": args.get("body"),
+        }
 
     def shutdown(self) -> None:
         self._shutdown_event.set()
@@ -250,8 +637,7 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         # constants for "default"), read the actually-resolved current config here so
         # the dashboard shows what's really configured, not just a generic hint. Only
         # the secret field is left with no default -- never echo a token back.
-        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
-        self._resolve_config(hermes_home)
+        self._resolve_config(self._current_hermes_home())
         return [
             {
                 "key": "hub_url",
@@ -282,6 +668,27 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                 "default": self._room or _DEFAULT_ROOM,
             },
             {
+                "key": "enable_kg_write",
+                "description": (
+                    "Let this agent add/edit facts in the shared knowledge graph "
+                    "(mempalace_kg_add/invalidate/supersede), not just query it. Off by default -- "
+                    "these mutate structured facts other agents rely on."
+                ),
+                "type": "boolean",
+                "default": self._enable_kg_write,
+            },
+            {
+                "key": "enable_coordination",
+                "description": (
+                    "Let this agent send and receive delegated tasks/patches over the shared "
+                    "agent logstream (mempalace_event_*, artifact_*, patch_submit). Off by "
+                    "default -- this is the consequential toggle: with it on, this agent can be "
+                    "handed work autonomously by another agent, not just asked to recall/file memory."
+                ),
+                "type": "boolean",
+                "default": self._enable_coordination,
+            },
+            {
                 "key": "token",
                 "description": "Bearer token for the hub",
                 "secret": True,
@@ -298,6 +705,8 @@ class MempalaceSharedBrainProvider(MemoryProvider):
             "agent_id": values.get("agent_id", "unraid-hermes"),
             "wing": values.get("wing", _DEFAULT_WING),
             "room": values.get("room", _DEFAULT_ROOM),
+            "enable_kg_write": bool(values.get("enable_kg_write", False)),
+            "enable_coordination": bool(values.get("enable_coordination", False)),
         }
         path.write_text(json.dumps(cfg, indent=2))
 

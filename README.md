@@ -56,6 +56,8 @@ echo "MEMPALACE_MCP_HTTP_TOKEN=<hub bearer token>" >> ~/.hermes/.env
 | `agent_id` | `MEMPALACE_AGENT_ID` | `hermes` | This agent's identity on the shared brain (`<machine>-<harness>` convention) |
 | `wing` | - | `hermes` | MemPalace wing (project/namespace) turns are filed under |
 | `room` | - | `conversation` | MemPalace room (category) turns are filed under |
+| `enable_kg_write` | - | `false` | Let this agent add/edit shared knowledge-graph facts, not just query them |
+| `enable_coordination` | - | `false` | Let this agent send/receive delegated tasks and patches over the shared logstream |
 | - | `MEMPALACE_MCP_HTTP_TOKEN` | - (required, secret) | Bearer token, `.env` only |
 
 Config file wins over env vars, which win over defaults.
@@ -67,8 +69,27 @@ Config file wins over env vars, which win over defaults.
 - `queue_prefetch()` / `prefetch()` - background `mempalace_search` call before each turn.
 - `sync_turn()` - files each completed turn into the palace via a bounded background queue
   (`mempalace_add_drawer`); the agent loop never blocks on it.
-- Exposes `mempalace_search` and `mempalace_add_drawer` as Hermes tools directly, so the model
-  can search/file proactively, not just through auto-injection.
+
+### Tools exposed to the model
+
+Always available (read-only, or self-contained writes to the agent's own diary):
+`mempalace_search`, `mempalace_add_drawer`, `mempalace_list_drawers`, `mempalace_status`,
+`mempalace_get_taxonomy`, `mempalace_kg_query`, `mempalace_get_drawer`, `mempalace_diary_write`,
+`mempalace_diary_read`.
+
+Opt-in via `enable_kg_write` - mutates the shared knowledge graph other agents rely on:
+`mempalace_kg_add`, `mempalace_kg_invalidate`, `mempalace_kg_supersede`.
+
+Opt-in via `enable_coordination` - the consequential one. Lets this agent send and receive
+delegated tasks and code patches over the shared agent logstream, meaning it can be handed
+work autonomously by another agent, not just asked to recall or file memory:
+`mempalace_event_append`, `mempalace_event_list`, `mempalace_event_wait`, `mempalace_event_ack`,
+`mempalace_artifact_put`, `mempalace_artifact_get`, `mempalace_patch_submit`.
+
+Both toggles are off by default and surfaced in `hermes memory setup` / the dashboard, not
+silently on. Identity fields (`from_agent`, `created_by`, `agent_name`) are always injected from
+the plugin's own `agent_id` config, never accepted from the model, so a tool call can't spoof
+another agent's identity on the shared brain.
 
 ## Wire format
 

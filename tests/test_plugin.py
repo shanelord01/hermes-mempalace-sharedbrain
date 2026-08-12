@@ -17,6 +17,10 @@ import __init__ as plugin_module  # noqa: E402
 
 MempalaceSharedBrainProvider = plugin_module.MempalaceSharedBrainProvider
 
+_BASE_TOOL_NAMES = {schema["name"] for schema in plugin_module._BASE_TOOL_SCHEMAS}
+_KG_WRITE_TOOL_NAMES = plugin_module._KG_WRITE_TOOL_NAMES
+_COORDINATION_TOOL_NAMES = plugin_module._COORDINATION_TOOL_NAMES
+
 
 class ConfigResolutionTests(unittest.TestCase):
     def setUp(self):
@@ -116,8 +120,57 @@ class HandleToolCallTests(unittest.TestCase):
         result = json.loads(provider.handle_tool_call("mempalace_search", {"query": "x"}))
         self.assertIn("error", result)
 
+    def test_diary_write_maps_content_to_entry_and_injects_agent_name(self):
+        """The hub's mempalace_diary_write requires agent_name (not something the model
+        should supply itself) and uses "entry" as its content field (not "content", which
+        is only accepted as an alias) - confirmed against the hub's real schema, not
+        assumed. This locks in that mapping.
+        """
+        provider = MempalaceSharedBrainProvider()
+        provider._active = True
+        provider._hub_url = "http://hub.example/mcp"
+        provider._token = "tok"
+        provider._agent_id = "unraid-hermes"
+        captured = {}
+
+        def fake_call_tool(tool_name, arguments):
+            captured["tool_name"] = tool_name
+            captured["arguments"] = arguments
+            return {}
+
+        provider._call_tool = fake_call_tool
+        provider.handle_tool_call("mempalace_diary_write", {"content": "did a thing"})
+        self.assertEqual(captured["tool_name"], "mempalace_diary_write")
+        self.assertEqual(captured["arguments"]["agent_name"], "unraid-hermes")
+        self.assertEqual(captured["arguments"]["entry"], "did a thing")
+        self.assertNotIn("content", captured["arguments"])
+
+    def test_diary_read_maps_limit_to_last_n_and_injects_agent_name(self):
+        provider = MempalaceSharedBrainProvider()
+        provider._active = True
+        provider._hub_url = "http://hub.example/mcp"
+        provider._token = "tok"
+        provider._agent_id = "unraid-hermes"
+        captured = {}
+
+        def fake_call_tool(tool_name, arguments):
+            captured["arguments"] = arguments
+            return {}
+
+        provider._call_tool = fake_call_tool
+        provider.handle_tool_call("mempalace_diary_read", {"limit": 5})
+        self.assertEqual(captured["arguments"]["agent_name"], "unraid-hermes")
+        self.assertEqual(captured["arguments"]["last_n"], 5)
+
 
 class ToolSchemaRegistrationTests(unittest.TestCase):
+    def setUp(self):
+        self.env_backup = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.env_backup)
+
     def test_schemas_available_before_initialize(self):
         """Regression test: Hermes snapshots get_tool_schemas() BEFORE calling
         initialize(), to build its tool-name -> provider routing table. A provider
@@ -128,7 +181,83 @@ class ToolSchemaRegistrationTests(unittest.TestCase):
         """
         provider = MempalaceSharedBrainProvider()  # note: initialize() NOT called
         names = {schema["name"] for schema in provider.get_tool_schemas()}
-        self.assertEqual(names, {"mempalace_search", "mempalace_add_drawer"})
+        self.assertEqual(names, _BASE_TOOL_NAMES)
+
+    def test_kg_write_and_coordination_tools_off_by_default(self):
+        provider = MempalaceSharedBrainProvider()
+        names = {schema["name"] for schema in provider.get_tool_schemas()}
+        self.assertFalse(names & _KG_WRITE_TOOL_NAMES)
+        self.assertFalse(names & _COORDINATION_TOOL_NAMES)
+
+    def test_kg_write_tools_appear_when_enabled_via_config_file(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "mempalace_sharedbrain.json"
+            cfg_path.write_text(json.dumps({"hub_url": "http://mempalace:8765/mcp", "enable_kg_write": True}))
+            os.environ["HERMES_HOME"] = tmp
+            provider = MempalaceSharedBrainProvider()
+            names = {schema["name"] for schema in provider.get_tool_schemas()}
+            self.assertTrue(_KG_WRITE_TOOL_NAMES.issubset(names))
+            self.assertFalse(names & _COORDINATION_TOOL_NAMES)
+
+    def test_coordination_tools_appear_when_enabled_via_config_file(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cfg_path = Path(tmp) / "mempalace_sharedbrain.json"
+            cfg_path.write_text(json.dumps({"hub_url": "http://mempalace:8765/mcp", "enable_coordination": True}))
+            os.environ["HERMES_HOME"] = tmp
+            provider = MempalaceSharedBrainProvider()
+            names = {schema["name"] for schema in provider.get_tool_schemas()}
+            self.assertTrue(_COORDINATION_TOOL_NAMES.issubset(names))
+            self.assertFalse(names & _KG_WRITE_TOOL_NAMES)
+
+
+class GatedToolDispatchTests(unittest.TestCase):
+    def _provider(self, enable_kg_write=False, enable_coordination=False):
+        provider = MempalaceSharedBrainProvider()
+        provider._active = True
+        provider._hub_url = "http://hub.example/mcp"
+        provider._token = "tok"
+        provider._agent_id = "test-agent"
+        provider._enable_kg_write = enable_kg_write
+        provider._enable_coordination = enable_coordination
+        return provider
+
+    def test_kg_write_refused_when_disabled(self):
+        provider = self._provider(enable_kg_write=False)
+        result = json.loads(
+            provider.handle_tool_call("mempalace_kg_add", {"subject": "a", "predicate": "b", "object": "c"})
+        )
+        self.assertIn("error", result)
+        self.assertIn("enable_kg_write", result["error"])
+
+    def test_coordination_refused_when_disabled(self):
+        provider = self._provider(enable_coordination=False)
+        result = json.loads(
+            provider.handle_tool_call("mempalace_event_append", {"type": "task.request", "stream": "x", "room": "y"})
+        )
+        self.assertIn("error", result)
+        self.assertIn("enable_coordination", result["error"])
+
+    def test_coordination_args_inject_agent_identity_not_model_supplied(self):
+        provider = self._provider(enable_coordination=True)
+        args = provider._coordination_args(
+            "mempalace_event_append", {"type": "task.request", "stream": "x", "room": "y", "from_agent": "spoofed"}
+        )
+        self.assertEqual(args["from_agent"], "test-agent")
+
+    def test_kg_write_args_shape_per_tool(self):
+        provider = self._provider(enable_kg_write=True)
+        add_args = provider._kg_write_args("mempalace_kg_add", {"subject": "a", "predicate": "b", "object": "c"})
+        self.assertEqual(add_args["subject"], "a")
+        supersede_args = provider._kg_write_args(
+            "mempalace_kg_supersede",
+            {"subject": "a", "predicate": "uses_model", "old_object": "x", "new_object": "y"},
+        )
+        self.assertEqual(supersede_args["old_object"], "x")
+        self.assertEqual(supersede_args["new_object"], "y")
 
 
 class ConfigSchemaDefaultsTests(unittest.TestCase):
