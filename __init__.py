@@ -65,6 +65,19 @@ def _read_config(hermes_home: str) -> Dict[str, Any]:
         return {}
 
 
+def _coerce_bool(value: Any) -> bool:
+    """True Python bools pass through; the dashboard's "choices" dropdown submits the
+    strings "true"/"false" instead (bool typed fields are silently dropped by Hermes's
+    dashboard API -- see get_config_schema), and bool("false") is True in plain Python,
+    so this can't be a bare bool() call.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        return value.strip().lower() == "true"
+    return bool(value)
+
+
 # Always available -- read-only or self-contained (own diary), safe by default.
 _BASE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
     {
@@ -668,13 +681,19 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                 "default": self._room or _DEFAULT_ROOM,
             },
             {
+                # No explicit "type" key -- confirmed against the actual Hermes-core Hindsight
+                # plugin source (plugins/memory/hindsight/__init__.py, auto_recall/auto_retain
+                # fields) that the dashboard infers "kind": "boolean" from the Python type of
+                # "default" itself. Declaring "type": "boolean" explicitly (as the MemoryProvider
+                # ABC docstring's own field-key list suggests) is what silently dropped these two
+                # fields from the dashboard's config API entirely -- root-caused by reading
+                # Hindsight's real source, not guessed.
                 "key": "enable_kg_write",
                 "description": (
                     "Let this agent add/edit facts in the shared knowledge graph "
                     "(mempalace_kg_add/invalidate/supersede), not just query it. Off by default -- "
                     "these mutate structured facts other agents rely on."
                 ),
-                "type": "boolean",
                 "default": self._enable_kg_write,
             },
             {
@@ -685,7 +704,6 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                     "default -- this is the consequential toggle: with it on, this agent can be "
                     "handed work autonomously by another agent, not just asked to recall/file memory."
                 ),
-                "type": "boolean",
                 "default": self._enable_coordination,
             },
             {
@@ -705,8 +723,8 @@ class MempalaceSharedBrainProvider(MemoryProvider):
             "agent_id": values.get("agent_id", "unraid-hermes"),
             "wing": values.get("wing", _DEFAULT_WING),
             "room": values.get("room", _DEFAULT_ROOM),
-            "enable_kg_write": bool(values.get("enable_kg_write", False)),
-            "enable_coordination": bool(values.get("enable_coordination", False)),
+            "enable_kg_write": _coerce_bool(values.get("enable_kg_write", False)),
+            "enable_coordination": _coerce_bool(values.get("enable_coordination", False)),
         }
         path.write_text(json.dumps(cfg, indent=2))
 
