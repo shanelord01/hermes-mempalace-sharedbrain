@@ -162,6 +162,33 @@ class HandleToolCallTests(unittest.TestCase):
         self.assertEqual(captured["arguments"]["agent_name"], "unraid-hermes")
         self.assertEqual(captured["arguments"]["last_n"], 5)
 
+    def test_list_drawers_not_locked_to_own_wing(self):
+        """Regression test for a real bug: handle_tool_call hardcoded
+        wing=self._wing for mempalace_list_drawers, so querying a room that only
+        exists in another wing on the shared brain always came back empty --
+        confirmed live via a real Hermes call (room="feedback" returned 0 results
+        despite mempalace_status showing 8 entries under a different wing).
+        list_drawers must default to every wing, matching mempalace_search's
+        scope, and pass through an explicit wing only when the caller asks.
+        """
+        provider = MempalaceSharedBrainProvider()
+        provider._active = True
+        provider._hub_url = "http://hub.example/mcp"
+        provider._token = "tok"
+        provider._wing = "hermes"
+        captured = {}
+
+        def fake_call_tool(tool_name, arguments):
+            captured["arguments"] = arguments
+            return {}
+
+        provider._call_tool = fake_call_tool
+        provider.handle_tool_call("mempalace_list_drawers", {"room": "feedback"})
+        self.assertIsNone(captured["arguments"]["wing"])
+
+        provider.handle_tool_call("mempalace_list_drawers", {"room": "feedback", "wing": "shane"})
+        self.assertEqual(captured["arguments"]["wing"], "shane")
+
 
 class ToolSchemaRegistrationTests(unittest.TestCase):
     def setUp(self):

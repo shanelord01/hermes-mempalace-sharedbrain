@@ -112,11 +112,20 @@ _BASE_TOOL_SCHEMAS: List[Dict[str, Any]] = [
         "description": (
             "List drawers with pagination -- a reliable completeness check that doesn't depend "
             "on semantic similarity the way mempalace_search does. Use this when you need to "
-            "confirm what's actually filed under a wing/room, not just what a query surfaces."
+            "confirm what's actually filed under a wing/room, not just what a query surfaces. "
+            "Searches across every wing on the shared brain by default, not just this agent's "
+            "own wing -- pass 'wing' to narrow to one."
         ),
         "parameters": {
             "type": "object",
             "properties": {
+                "wing": {
+                    "type": "string",
+                    "description": (
+                        "Filter by wing (optional). Omit to search every wing on the shared "
+                        "brain, matching mempalace_search's default scope."
+                    ),
+                },
                 "room": {"type": "string", "description": "Filter by room (optional)"},
                 "limit": {"type": "integer", "description": "Max results per page (default 20, max 100)"},
                 "offset": {"type": "integer", "description": "Offset for pagination (default 0)"},
@@ -502,10 +511,18 @@ class MempalaceSharedBrainProvider(MemoryProvider):
             )
             return json.dumps(self._unwrap(result))
         if tool_name == "mempalace_list_drawers":
+            # Unlike add_drawer (which always writes into this agent's own wing --
+            # writes should never land somewhere the caller didn't ask for), listing
+            # defaults to every wing on the shared brain, matching mempalace_search's
+            # scope. Hardcoding self._wing here was a real bug: it silently limited
+            # every completeness check to this agent's own wing, so querying a room
+            # that only exists in another wing always came back empty. Confirmed
+            # live -- Hermes reported exactly this (room="feedback" returning 0
+            # results despite mempalace_status showing 8 entries under shane/feedback).
             result = self._call_tool(
                 "mempalace_list_drawers",
                 {
-                    "wing": self._wing,
+                    "wing": args.get("wing"),
                     "room": args.get("room"),
                     "limit": args.get("limit", 20),
                     "offset": args.get("offset", 0),
