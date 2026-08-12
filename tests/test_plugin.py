@@ -104,8 +104,31 @@ class EnvelopeHandlingTests(unittest.TestCase):
 class HandleToolCallTests(unittest.TestCase):
     def test_unknown_tool_raises(self):
         provider = MempalaceSharedBrainProvider()
+        provider._active = True
+        provider._hub_url = "http://hub.example/mcp"
+        provider._token = "tok"
         with self.assertRaises(NotImplementedError):
             provider.handle_tool_call("not_a_real_tool", {})
+
+    def test_inactive_provider_returns_error_json_not_raise(self):
+        provider = MempalaceSharedBrainProvider()
+        provider._active = False
+        result = json.loads(provider.handle_tool_call("mempalace_search", {"query": "x"}))
+        self.assertIn("error", result)
+
+
+class ToolSchemaRegistrationTests(unittest.TestCase):
+    def test_schemas_available_before_initialize(self):
+        """Regression test: Hermes snapshots get_tool_schemas() BEFORE calling
+        initialize(), to build its tool-name -> provider routing table. A provider
+        that gates this on post-initialize state (e.g. self._active) never gets its
+        tools registered, and every call then fails as "Unknown tool" without ever
+        reaching handle_tool_call. Schemas must be available on a freshly
+        constructed, never-initialized provider.
+        """
+        provider = MempalaceSharedBrainProvider()  # note: initialize() NOT called
+        names = {schema["name"] for schema in provider.get_tool_schemas()}
+        self.assertEqual(names, {"mempalace_search", "mempalace_add_drawer"})
 
 
 if __name__ == "__main__":

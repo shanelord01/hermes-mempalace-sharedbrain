@@ -167,8 +167,12 @@ class MempalaceSharedBrainProvider(MemoryProvider):
             logger.warning("mempalace_sharedbrain: write queue full, dropping turn")
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        if not self._active:
-            return []
+        # Hermes' agent.memory_manager snapshots this BEFORE initialize() runs, to
+        # build its tool-name -> provider routing table. Gating on self._active (only
+        # set inside initialize()) means the dispatcher never learns these tool names
+        # exist, and every call then fails as "Unknown tool" without ever reaching
+        # handle_tool_call. Schemas describe the interface, not runtime readiness --
+        # readiness is checked inside handle_tool_call instead.
         return [
             {
                 "name": "mempalace_search",
@@ -203,6 +207,10 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         ]
 
     def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        if not self._active:
+            return json.dumps({"error": "mempalace-sharedbrain not active (cron/flush context)."})
+        if not self._hub_url or not self._token:
+            return json.dumps({"error": "mempalace-sharedbrain not configured (missing hub_url or token)."})
         if tool_name == "mempalace_search":
             result = self._call_tool(
                 "mempalace_search",
