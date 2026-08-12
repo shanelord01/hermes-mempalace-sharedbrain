@@ -307,6 +307,22 @@ class ConfigSchemaDefaultsTests(unittest.TestCase):
         self.assertEqual(schema["hub_url"]["default"], "http://mempalace:8765/mcp")
         self.assertEqual(schema["agent_id"]["default"], "unraid-hermes")
 
+    def test_every_field_warns_a_restart_is_needed(self):
+        """Regression test: initialize() -- where config actually reaches the running
+        provider -- only runs once per gateway process start, not per session. A saved
+        config change (via the dashboard or hermes memory setup) has no effect until the
+        gateway restarts, confirmed live (enable_kg_write didn't expose mempalace_kg_add
+        in an active session until the container restarted). Every field must say so,
+        not just the two toggles that happened to get tested first.
+        """
+        provider = MempalaceSharedBrainProvider()
+        for field in provider.get_config_schema():
+            self.assertIn(
+                "restart",
+                field["description"].lower(),
+                msg=f"field {field['key']!r} description doesn't mention restarting the gateway",
+            )
+
     def test_token_field_never_has_a_default(self):
         os.environ["MEMPALACE_MCP_HTTP_TOKEN"] = "super-secret-token"
         provider = MempalaceSharedBrainProvider()

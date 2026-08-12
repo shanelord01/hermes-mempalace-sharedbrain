@@ -62,6 +62,14 @@ echo "MEMPALACE_MCP_HTTP_TOKEN=<hub bearer token>" >> ~/.hermes/.env
 
 Config file wins over env vars, which win over defaults.
 
+**Every field above needs a Hermes gateway restart to take effect, not just a save.**
+`initialize()` -- where this config actually gets read into the running provider -- is
+called once per gateway process start, not per session or per turn. Saving a change via
+`hermes memory setup` or the dashboard updates the file immediately, but the running
+gateway keeps using whatever it read at its own last startup until restarted. Confirmed
+live: toggling `enable_kg_write` on did not expose `mempalace_kg_add` in an active
+session until the gateway container was restarted.
+
 ## What it does
 
 - `system_prompt_block()` - teaches the model the shared-brain etiquette (search before

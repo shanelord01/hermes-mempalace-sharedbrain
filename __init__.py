@@ -668,12 +668,20 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         # the dashboard shows what's really configured, not just a generic hint. Only
         # the secret field is left with no default -- never echo a token back.
         self._resolve_config(self._current_hermes_home())
+        # Every field below is read fresh only inside initialize(), which Hermes calls
+        # once per gateway process start, not per session or per turn -- confirmed live:
+        # toggling enable_kg_write via the dashboard alone did not expose the new tools
+        # until the gateway container was restarted. Restart applies to every field
+        # here, not just the two enable_* toggles, since they all flow through the same
+        # initialize()-gated instance state.
+        _RESTART_NOTE = " Restart the Hermes gateway to apply."
         return [
             {
                 "key": "hub_url",
                 "description": (
                     "MemPalace hub /mcp URL, e.g. http://mempalace:8765/mcp (same-host "
-                    "container network) or https://your-tailnet-host/mcp (remote)"
+                    "container network) or https://your-tailnet-host/mcp (remote)."
+                    + _RESTART_NOTE
                 ),
                 "required": True,
                 "default": self._hub_url or None,
@@ -682,19 +690,19 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                 "key": "agent_id",
                 "description": (
                     "This agent's identity on the shared brain, <machine>-<harness> format, "
-                    "e.g. unraid-hermes"
+                    "e.g. unraid-hermes." + _RESTART_NOTE
                 ),
                 "required": True,
                 "default": self._agent_id or "unraid-hermes",
             },
             {
                 "key": "wing",
-                "description": "MemPalace wing (project/namespace) to file Hermes turns under",
+                "description": "MemPalace wing (project/namespace) to file Hermes turns under." + _RESTART_NOTE,
                 "default": self._wing or _DEFAULT_WING,
             },
             {
                 "key": "room",
-                "description": "MemPalace room (category) to file Hermes turns under",
+                "description": "MemPalace room (category) to file Hermes turns under." + _RESTART_NOTE,
                 "default": self._room or _DEFAULT_ROOM,
             },
             {
@@ -709,7 +717,7 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                 "description": (
                     "Let this agent add/edit facts in the shared knowledge graph "
                     "(mempalace_kg_add/invalidate/supersede), not just query it. Off by default -- "
-                    "these mutate structured facts other agents rely on."
+                    "these mutate structured facts other agents rely on." + _RESTART_NOTE
                 ),
                 "default": self._enable_kg_write,
             },
@@ -720,12 +728,13 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                     "agent logstream (mempalace_event_*, artifact_*, patch_submit). Off by "
                     "default -- this is the consequential toggle: with it on, this agent can be "
                     "handed work autonomously by another agent, not just asked to recall/file memory."
+                    + _RESTART_NOTE
                 ),
                 "default": self._enable_coordination,
             },
             {
                 "key": "token",
-                "description": "Bearer token for the hub",
+                "description": "Bearer token for the hub." + _RESTART_NOTE,
                 "secret": True,
                 "required": True,
                 "env_var": "MEMPALACE_MCP_HTTP_TOKEN",
