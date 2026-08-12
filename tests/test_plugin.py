@@ -1,6 +1,6 @@
 """Tests for the MemPalace shared-brain Hermes plugin.
 
-No network access — exercises config resolution and JSON-RPC envelope handling
+No network access - exercises config resolution and JSON-RPC envelope handling
 against a stub HTTP layer, since a real test would need a live hub.
 """
 
@@ -129,6 +129,33 @@ class ToolSchemaRegistrationTests(unittest.TestCase):
         provider = MempalaceSharedBrainProvider()  # note: initialize() NOT called
         names = {schema["name"] for schema in provider.get_tool_schemas()}
         self.assertEqual(names, {"mempalace_search", "mempalace_add_drawer"})
+
+
+class ConfigSchemaDefaultsTests(unittest.TestCase):
+    def setUp(self):
+        self.env_backup = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.env_backup)
+
+    def test_hub_url_default_reflects_current_config(self):
+        """The dashboard shows get_config_schema()'s "default" for each field, so it
+        must reflect what's actually configured right now, not a hardcoded hint --
+        otherwise a working setup looks blank/unconfigured in the UI.
+        """
+        os.environ["MEMPALACE_HUB_URL"] = "http://mempalace:8765/mcp"
+        os.environ["MEMPALACE_AGENT_ID"] = "unraid-hermes"
+        provider = MempalaceSharedBrainProvider()
+        schema = {field["key"]: field for field in provider.get_config_schema()}
+        self.assertEqual(schema["hub_url"]["default"], "http://mempalace:8765/mcp")
+        self.assertEqual(schema["agent_id"]["default"], "unraid-hermes")
+
+    def test_token_field_never_has_a_default(self):
+        os.environ["MEMPALACE_MCP_HTTP_TOKEN"] = "super-secret-token"
+        provider = MempalaceSharedBrainProvider()
+        schema = {field["key"]: field for field in provider.get_config_schema()}
+        self.assertNotIn("default", schema["token"])
 
 
 if __name__ == "__main__":

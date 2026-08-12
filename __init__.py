@@ -246,6 +246,12 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         return []  # no local state -- everything lives on the hub
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
+        # Unlike the official MemPalace-Hermes integration (which uses static class
+        # constants for "default"), read the actually-resolved current config here so
+        # the dashboard shows what's really configured, not just a generic hint. Only
+        # the secret field is left with no default -- never echo a token back.
+        hermes_home = os.environ.get("HERMES_HOME", os.path.expanduser("~/.hermes"))
+        self._resolve_config(hermes_home)
         return [
             {
                 "key": "hub_url",
@@ -254,6 +260,7 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                     "container network) or https://your-tailnet-host/mcp (remote)"
                 ),
                 "required": True,
+                "default": self._hub_url or None,
             },
             {
                 "key": "agent_id",
@@ -262,17 +269,17 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                     "e.g. unraid-hermes"
                 ),
                 "required": True,
-                "default": "unraid-hermes",
+                "default": self._agent_id or "unraid-hermes",
             },
             {
                 "key": "wing",
                 "description": "MemPalace wing (project/namespace) to file Hermes turns under",
-                "default": _DEFAULT_WING,
+                "default": self._wing or _DEFAULT_WING,
             },
             {
                 "key": "room",
                 "description": "MemPalace room (category) to file Hermes turns under",
-                "default": _DEFAULT_ROOM,
+                "default": self._room or _DEFAULT_ROOM,
             },
             {
                 "key": "token",

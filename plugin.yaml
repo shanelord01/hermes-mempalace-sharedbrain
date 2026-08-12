@@ -1,6 +1,6 @@
 name: mempalace-sharedbrain
 version: 1.0.0
-description: "MemPalace shared-brain hub memory provider — multi-machine, multi-agent shared memory over MCP/HTTP. No local dependencies, no API key required by the plugin itself (the hub holds its own bearer token)."
+description: "MemPalace shared-brain hub memory provider - multi-machine, multi-agent shared memory over MCP/HTTP. No local dependencies, no API key required by the plugin itself (the hub holds its own bearer token)."
 external_dependencies: []
 hooks:
   - on_session_end
