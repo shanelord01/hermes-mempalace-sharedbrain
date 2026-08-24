@@ -26,7 +26,7 @@ over HTTP, and its bearer token.
 Don't have a hub exposed yet, or only want to expose it with real per-user OAuth login instead of
 a shared static token? See the wiki:
 **[Running a MemPalace hub behind Newt/Pangolin, with OAuth in front of it](https://github.com/shanelord01/hermes-mempalace-sharedbrain/wiki/MemPalace-Hub-behind-Newt-Pangolin-OAuth)**
-— a generic, reproducible deployment writeup covering MemPalace + Qdrant, an OAuth 2.1 proxy
+- a generic, reproducible deployment writeup covering MemPalace + Qdrant, an OAuth 2.1 proxy
 backed by Pocket ID, and exposing it with zero open inbound ports via Newt/Pangolin.
 
 ## Install
