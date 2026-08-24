@@ -23,11 +23,10 @@ A running MemPalace hub (`mempalace serve`, see the
 [Remote / Team Server guide](https://mempalaceofficial.com/guide/remote-server.html)) reachable
 over HTTP, and its bearer token.
 
-Don't have a hub exposed yet, or only want to expose it with real per-user OAuth login instead of
-a shared static token? See the wiki:
-**[Running a MemPalace hub behind Newt/Pangolin, with OAuth in front of it](https://github.com/shanelord01/hermes-mempalace-sharedbrain/wiki/MemPalace-Hub-behind-Newt-Pangolin-OAuth)**
-- a generic, reproducible deployment writeup covering MemPalace + Qdrant, an OAuth 2.1 proxy
-backed by Pocket ID, and exposing it with zero open inbound ports via Newt/Pangolin.
+For deploying a hub with real per-user OAuth login instead of a shared static token, see the wiki
+page [Running a MemPalace hub behind Newt/Pangolin, with OAuth in front of it](https://github.com/shanelord01/hermes-mempalace-sharedbrain/wiki/MemPalace-Hub-behind-Newt-Pangolin-OAuth):
+a generic, reproducible deployment covering MemPalace + Qdrant, an OAuth 2.1 proxy backed by
+Pocket ID, and exposing it with zero open inbound ports via Newt/Pangolin.
 
 ## Install
 
