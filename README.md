@@ -25,8 +25,10 @@ over HTTP, and its bearer token.
 
 For deploying a hub with real per-user OAuth login instead of a shared static token, see the wiki
 page [Running a MemPalace hub behind Newt/Pangolin, with OAuth in front of it](https://github.com/shanelord01/hermes-mempalace-sharedbrain/wiki/MemPalace-Hub-behind-Newt-Pangolin-OAuth):
-a generic, reproducible deployment covering MemPalace + Qdrant, an OAuth 2.1 proxy backed by
-Pocket ID, and exposing it with zero open inbound ports via Newt/Pangolin.
+a generic, reproducible deployment covering MemPalace + Qdrant, Pocket ID as the OAuth 2.1
+authorization server (via Client ID Metadata Documents, so nothing to register or paste into any
+client), a small caddy-jwt container in front of the hub, and zero open inbound ports via
+Newt/Pangolin. Works with Claude Code, Claude Desktop, the mobile apps and claude.ai.
 
 ## Install
 
