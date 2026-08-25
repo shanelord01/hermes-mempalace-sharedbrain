@@ -23,12 +23,10 @@ A running MemPalace hub (`mempalace serve`, see the
 [Remote / Team Server guide](https://mempalaceofficial.com/guide/remote-server.html)) reachable
 over HTTP, and its bearer token.
 
-For deploying a hub with real per-user OAuth login instead of a shared static token, see the wiki
-page [Running a MemPalace hub behind Newt/Pangolin, with OAuth in front of it](https://github.com/shanelord01/hermes-mempalace-sharedbrain/wiki/MemPalace-Hub-behind-Newt-Pangolin-OAuth):
-a generic, reproducible deployment covering MemPalace + Qdrant, Pocket ID as the OAuth 2.1
-authorization server (via Client ID Metadata Documents, so nothing to register or paste into any
-client), a small caddy-jwt container in front of the hub, and zero open inbound ports via
-Newt/Pangolin. Works with Claude Code, Claude Desktop, the mobile apps and claude.ai.
+To host a hub with per-user OAuth login instead of a shared static token, see
+[Running a MemPalace hub behind Newt/Pangolin with Pocket ID OAuth](https://github.com/shanelord01/hermes-mempalace-sharedbrain/wiki/MemPalace-Hub-behind-Newt-Pangolin-OAuth)
+on the wiki: MemPalace + Qdrant behind Newt/Pangolin with no open inbound ports, Pocket ID as the
+OAuth 2.1 authorization server, and a caddy-jwt container in front of the hub.
 
 ## Install
 
