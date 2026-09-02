@@ -2,11 +2,20 @@
 
 No network access - exercises config resolution and JSON-RPC envelope handling
 against a stub HTTP layer, since a real test would need a live hub.
+
+Any test that lets the provider resolve its own config must inherit from
+IsolatedConfigTestCase. Several provider methods (get_tool_schemas,
+get_config_schema, is_available, unavailable_reason) deliberately re-resolve
+config from $HERMES_HOME on every call, so a test that does not pin HERMES_HOME
+reads whatever the machine running the suite actually has installed. That made
+two "off by default" assertions pass on a dev box with no Hermes and fail on the
+deployment host, where the live config has the gated flags switched on.
 """
 
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -22,14 +31,48 @@ _KG_WRITE_TOOL_NAMES = plugin_module._KG_WRITE_TOOL_NAMES
 _COORDINATION_TOOL_NAMES = plugin_module._COORDINATION_TOOL_NAMES
 
 
-class ConfigResolutionTests(unittest.TestCase):
+class IsolatedConfigTestCase(unittest.TestCase):
+    """Base case that pins HERMES_HOME to an empty directory.
+
+    Restores the environment afterwards, and points HERMES_HOME at a fresh temp
+    dir with no mempalace_sharedbrain.json in it, so "no config file" means
+    exactly that no matter what is installed on the machine running the suite.
+    Subclasses that want a config file write one into self.hermes_home.
+    """
+
     def setUp(self):
         self.env_backup = dict(os.environ)
+        self._tmp = tempfile.TemporaryDirectory()
+        self.hermes_home = self._tmp.name
+        os.environ["HERMES_HOME"] = self.hermes_home
 
     def tearDown(self):
         os.environ.clear()
         os.environ.update(self.env_backup)
+        self._tmp.cleanup()
 
+
+class IsolationContractTests(IsolatedConfigTestCase):
+    """The base class is load-bearing, so assert it actually does its job."""
+
+    def test_hermes_home_is_pinned_to_a_directory_with_no_config_file(self):
+        self.assertEqual(os.environ["HERMES_HOME"], self.hermes_home)
+        self.assertFalse((Path(self.hermes_home) / "mempalace_sharedbrain.json").exists())
+
+    def test_provider_resolves_against_the_pinned_home_not_the_real_one(self):
+        """The exact bug this base class exists for: without the pin, a provider
+        constructed here reads whatever config the machine running the suite has,
+        which is how "off by default" passed on a dev box and failed on the
+        deployment host.
+        """
+        provider = MempalaceSharedBrainProvider()
+        self.assertEqual(provider._current_hermes_home(), self.hermes_home)
+        provider.get_tool_schemas()
+        self.assertFalse(provider._enable_kg_write)
+        self.assertFalse(provider._enable_coordination)
+
+
+class ConfigResolutionTests(IsolatedConfigTestCase):
     def test_env_vars_used_when_no_config_file(self):
         os.environ["MEMPALACE_HUB_URL"] = "https://example.ts.net/mcp"
         os.environ["MEMPALACE_AGENT_ID"] = "test-machine-hermes"
@@ -40,17 +83,14 @@ class ConfigResolutionTests(unittest.TestCase):
         self.assertEqual(provider._agent_id, "test-machine-hermes")
         self.assertEqual(provider._token, "tok123")
 
-    def test_config_file_overrides_env(self, ):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg_path = Path(tmp) / "mempalace_sharedbrain.json"
-            cfg_path.write_text(json.dumps({"hub_url": "http://mempalace:8765/mcp", "agent_id": "file-agent"}))
-            os.environ["MEMPALACE_HUB_URL"] = "https://env-should-lose.example/mcp"
-            provider = MempalaceSharedBrainProvider()
-            provider._resolve_config(tmp)
-            self.assertEqual(provider._hub_url, "http://mempalace:8765/mcp")
-            self.assertEqual(provider._agent_id, "file-agent")
+    def test_config_file_overrides_env(self):
+        cfg_path = Path(self.hermes_home) / "mempalace_sharedbrain.json"
+        cfg_path.write_text(json.dumps({"hub_url": "http://mempalace:8765/mcp", "agent_id": "file-agent"}))
+        os.environ["MEMPALACE_HUB_URL"] = "https://env-should-lose.example/mcp"
+        provider = MempalaceSharedBrainProvider()
+        provider._resolve_config(self.hermes_home)
+        self.assertEqual(provider._hub_url, "http://mempalace:8765/mcp")
+        self.assertEqual(provider._agent_id, "file-agent")
 
     def test_is_available_false_without_token(self):
         os.environ.pop("MEMPALACE_MCP_HTTP_TOKEN", None)
@@ -190,14 +230,7 @@ class HandleToolCallTests(unittest.TestCase):
         self.assertEqual(captured["arguments"]["wing"], "shane")
 
 
-class ToolSchemaRegistrationTests(unittest.TestCase):
-    def setUp(self):
-        self.env_backup = dict(os.environ)
-
-    def tearDown(self):
-        os.environ.clear()
-        os.environ.update(self.env_backup)
-
+class ToolSchemaRegistrationTests(IsolatedConfigTestCase):
     def test_schemas_available_before_initialize(self):
         """Regression test: Hermes snapshots get_tool_schemas() BEFORE calling
         initialize(), to build its tool-name -> provider routing table. A provider
@@ -216,29 +249,24 @@ class ToolSchemaRegistrationTests(unittest.TestCase):
         self.assertFalse(names & _KG_WRITE_TOOL_NAMES)
         self.assertFalse(names & _COORDINATION_TOOL_NAMES)
 
-    def test_kg_write_tools_appear_when_enabled_via_config_file(self):
-        import tempfile
+    def _write_config(self, **flags):
+        cfg = {"hub_url": "http://mempalace:8765/mcp"}
+        cfg.update(flags)
+        (Path(self.hermes_home) / "mempalace_sharedbrain.json").write_text(json.dumps(cfg))
 
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg_path = Path(tmp) / "mempalace_sharedbrain.json"
-            cfg_path.write_text(json.dumps({"hub_url": "http://mempalace:8765/mcp", "enable_kg_write": True}))
-            os.environ["HERMES_HOME"] = tmp
-            provider = MempalaceSharedBrainProvider()
-            names = {schema["name"] for schema in provider.get_tool_schemas()}
-            self.assertTrue(_KG_WRITE_TOOL_NAMES.issubset(names))
-            self.assertFalse(names & _COORDINATION_TOOL_NAMES)
+    def test_kg_write_tools_appear_when_enabled_via_config_file(self):
+        self._write_config(enable_kg_write=True)
+        provider = MempalaceSharedBrainProvider()
+        names = {schema["name"] for schema in provider.get_tool_schemas()}
+        self.assertTrue(_KG_WRITE_TOOL_NAMES.issubset(names))
+        self.assertFalse(names & _COORDINATION_TOOL_NAMES)
 
     def test_coordination_tools_appear_when_enabled_via_config_file(self):
-        import tempfile
-
-        with tempfile.TemporaryDirectory() as tmp:
-            cfg_path = Path(tmp) / "mempalace_sharedbrain.json"
-            cfg_path.write_text(json.dumps({"hub_url": "http://mempalace:8765/mcp", "enable_coordination": True}))
-            os.environ["HERMES_HOME"] = tmp
-            provider = MempalaceSharedBrainProvider()
-            names = {schema["name"] for schema in provider.get_tool_schemas()}
-            self.assertTrue(_COORDINATION_TOOL_NAMES.issubset(names))
-            self.assertFalse(names & _KG_WRITE_TOOL_NAMES)
+        self._write_config(enable_coordination=True)
+        provider = MempalaceSharedBrainProvider()
+        names = {schema["name"] for schema in provider.get_tool_schemas()}
+        self.assertTrue(_COORDINATION_TOOL_NAMES.issubset(names))
+        self.assertFalse(names & _KG_WRITE_TOOL_NAMES)
 
 
 class GatedToolDispatchTests(unittest.TestCase):
@@ -287,14 +315,7 @@ class GatedToolDispatchTests(unittest.TestCase):
         self.assertEqual(supersede_args["new_object"], "y")
 
 
-class ConfigSchemaDefaultsTests(unittest.TestCase):
-    def setUp(self):
-        self.env_backup = dict(os.environ)
-
-    def tearDown(self):
-        os.environ.clear()
-        os.environ.update(self.env_backup)
-
+class ConfigSchemaDefaultsTests(IsolatedConfigTestCase):
     def test_hub_url_default_reflects_current_config(self):
         """The dashboard shows get_config_schema()'s "default" for each field, so it
         must reflect what's actually configured right now, not a hardcoded hint --
@@ -421,18 +442,11 @@ class RecallStatusTests(unittest.TestCase):
         self.assertIsNone(provider.recall_status())
 
 
-class UnavailableReasonTests(unittest.TestCase):
+class UnavailableReasonTests(IsolatedConfigTestCase):
     """is_available() gates initialization, so a provider that reports unavailable is
     never initialized and anything it would log from initialize() is unreachable.
     This hook is the only place a usable hint can reach the operator.
     """
-
-    def setUp(self):
-        self.env_backup = dict(os.environ)
-
-    def tearDown(self):
-        os.environ.clear()
-        os.environ.update(self.env_backup)
 
     def _reason_with(self, hub_url=None, token=None):
         os.environ.pop("MEMPALACE_HUB_URL", None)
@@ -441,7 +455,6 @@ class UnavailableReasonTests(unittest.TestCase):
             os.environ["MEMPALACE_HUB_URL"] = hub_url
         if token:
             os.environ["MEMPALACE_MCP_HTTP_TOKEN"] = token
-        os.environ["HERMES_HOME"] = "/nonexistent/hermes/home"
         return MempalaceSharedBrainProvider().unavailable_reason()
 
     def test_empty_when_fully_configured(self):
@@ -479,7 +492,6 @@ class UnavailableReasonTests(unittest.TestCase):
         """The hook must not depend on is_available() having run to populate state."""
         os.environ["MEMPALACE_HUB_URL"] = "http://hub.example/mcp"
         os.environ["MEMPALACE_MCP_HTTP_TOKEN"] = "tok"
-        os.environ["HERMES_HOME"] = "/nonexistent/hermes/home"
         provider = MempalaceSharedBrainProvider()
         self.assertEqual(provider._hub_url, "")  # nothing resolved yet
         self.assertEqual(provider.unavailable_reason(), "")
