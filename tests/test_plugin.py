@@ -330,5 +330,160 @@ class ConfigSchemaDefaultsTests(unittest.TestCase):
         self.assertNotIn("default", schema["token"])
 
 
+def _search_envelope(*texts):
+    """Build the hub's real MCP response shape: result.content[].text is itself
+    a JSON-encoded string holding the tool's actual output."""
+    return {
+        "content": [
+            {"type": "text", "text": json.dumps({"results": [{"text": t} for t in texts]})}
+        ]
+    }
+
+
+class RecallStatusTests(unittest.TestCase):
+    """The host (Hermes >= 0.21.0) calls recall_status() right after prefetch() to
+    render a deterministic "recalled N memories" line that does not depend on the
+    model choosing to mention it. The ABC's one hard requirement is that it reflect
+    only the LAST prefetch, never a stale prior count.
+    """
+
+    def _ready_provider(self):
+        provider = MempalaceSharedBrainProvider()
+        provider._active = True
+        provider._hub_url = "http://hub.example/mcp"
+        provider._token = "tok"
+        return provider
+
+    def test_no_status_before_any_prefetch(self):
+        self.assertIsNone(self._ready_provider().recall_status())
+
+    def test_status_reports_count_label_and_glyph(self):
+        provider = self._ready_provider()
+        provider._prefetch_cache["s1"] = ("injected text", 3)
+        provider.prefetch("anything", session_id="s1")
+        status = provider.recall_status()
+        self.assertIsNotNone(status)
+        self.assertEqual(status.count, 3)
+        self.assertEqual(status.provider_label, "MemPalace")
+        self.assertEqual(status.glyph, plugin_module._MEMPALACE_GLYPH)
+
+    def test_miss_clears_a_previous_turns_status(self):
+        """The staleness hazard the ABC warns about: turn 1 recalls, turn 2 recalls
+        nothing. Turn 2 must not still report turn 1's count.
+        """
+        provider = self._ready_provider()
+        provider._prefetch_cache["s1"] = ("injected text", 2)
+        provider.prefetch("q", session_id="s1")
+        self.assertEqual(provider.recall_status().count, 2)
+
+        provider.prefetch("q", session_id="s1")  # nothing cached this turn
+        self.assertIsNone(provider.recall_status())
+
+    def test_count_matches_the_memories_actually_injected(self):
+        """The count and the injected block come from one extraction pass, so a hit
+        the formatter drops (empty text) can never be counted as recalled.
+        """
+        provider = self._ready_provider()
+        provider._call_tool = lambda *a, **kw: _search_envelope("fact one", "", "fact two")
+        provider._do_prefetch("query", "s1")
+
+        text = provider.prefetch("query", session_id="s1")
+        self.assertIn("fact one", text)
+        self.assertIn("fact two", text)
+        self.assertEqual(provider.recall_status().count, 2)
+        self.assertEqual(text.count("---"), 1)  # two hits, one separator
+
+    def test_empty_search_result_injects_nothing_and_reports_nothing(self):
+        provider = self._ready_provider()
+        provider._call_tool = lambda *a, **kw: _search_envelope()
+        provider._do_prefetch("query", "s1")
+
+        self.assertEqual(provider.prefetch("query", session_id="s1"), "")
+        self.assertIsNone(provider.recall_status())
+
+    def test_falls_back_to_the_unkeyed_cache_entry(self):
+        """queue_prefetch stores under "" when no session_id was supplied; a later
+        prefetch that does carry one must still find it.
+        """
+        provider = self._ready_provider()
+        provider._prefetch_cache[""] = ("injected text", 1)
+        self.assertEqual(provider.prefetch("q", session_id="s1"), "injected text")
+        self.assertEqual(provider.recall_status().count, 1)
+
+    def test_prefetch_is_consume_once(self):
+        """Preserved from the original pop() semantics: the cached block is injected
+        into exactly one turn, and the status clears with it.
+        """
+        provider = self._ready_provider()
+        provider._prefetch_cache["s1"] = ("injected text", 1)
+        self.assertEqual(provider.prefetch("q", session_id="s1"), "injected text")
+        self.assertEqual(provider.prefetch("q", session_id="s1"), "")
+        self.assertIsNone(provider.recall_status())
+
+
+class UnavailableReasonTests(unittest.TestCase):
+    """is_available() gates initialization, so a provider that reports unavailable is
+    never initialized and anything it would log from initialize() is unreachable.
+    This hook is the only place a usable hint can reach the operator.
+    """
+
+    def setUp(self):
+        self.env_backup = dict(os.environ)
+
+    def tearDown(self):
+        os.environ.clear()
+        os.environ.update(self.env_backup)
+
+    def _reason_with(self, hub_url=None, token=None):
+        os.environ.pop("MEMPALACE_HUB_URL", None)
+        os.environ.pop("MEMPALACE_MCP_HTTP_TOKEN", None)
+        if hub_url:
+            os.environ["MEMPALACE_HUB_URL"] = hub_url
+        if token:
+            os.environ["MEMPALACE_MCP_HTTP_TOKEN"] = token
+        os.environ["HERMES_HOME"] = "/nonexistent/hermes/home"
+        return MempalaceSharedBrainProvider().unavailable_reason()
+
+    def test_empty_when_fully_configured(self):
+        self.assertEqual(self._reason_with("http://hub.example/mcp", "tok"), "")
+
+    def test_names_hub_url_when_only_that_is_missing(self):
+        reason = self._reason_with(token="tok")
+        self.assertIn("hub_url", reason)
+        self.assertNotIn("MEMPALACE_MCP_HTTP_TOKEN", reason)
+
+    def test_names_the_token_env_var_when_only_that_is_missing(self):
+        reason = self._reason_with(hub_url="http://hub.example/mcp")
+        self.assertIn("MEMPALACE_MCP_HTTP_TOKEN", reason)
+        self.assertNotIn("hub_url", reason)
+
+    def test_names_both_when_nothing_is_configured(self):
+        reason = self._reason_with()
+        self.assertIn("hub_url", reason)
+        self.assertIn("MEMPALACE_MCP_HTTP_TOKEN", reason)
+
+    def test_never_echoes_the_token_back(self):
+        """The reason string is surfaced in host warnings and logs. Whatever else it
+        says, it must not carry the secret it is complaining about.
+        """
+        reason = self._reason_with(token="super-secret-token")
+        self.assertNotIn("super-secret-token", reason)
+
+    def test_mentions_restarting_the_gateway(self):
+        """Same reason every config-schema field says so: config is read once per
+        gateway process start, so fixing the file alone changes nothing.
+        """
+        self.assertIn("restart", self._reason_with().lower())
+
+    def test_resolves_config_without_is_available_being_called_first(self):
+        """The hook must not depend on is_available() having run to populate state."""
+        os.environ["MEMPALACE_HUB_URL"] = "http://hub.example/mcp"
+        os.environ["MEMPALACE_MCP_HTTP_TOKEN"] = "tok"
+        os.environ["HERMES_HOME"] = "/nonexistent/hermes/home"
+        provider = MempalaceSharedBrainProvider()
+        self.assertEqual(provider._hub_url, "")  # nothing resolved yet
+        self.assertEqual(provider.unavailable_reason(), "")
+
+
 if __name__ == "__main__":
     unittest.main()

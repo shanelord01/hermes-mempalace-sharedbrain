@@ -30,8 +30,9 @@ import queue
 import threading
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 try:
     from agent.memory_provider import MemoryProvider  # type: ignore[import-not-found]
@@ -41,6 +42,26 @@ except ImportError:  # pragma: no cover - Hermes not installed
         """Stub used when ``agent.memory_provider`` cannot be imported."""
 
 
+# Deliberately a SEPARATE try/except from the MemoryProvider import above, not a
+# second name on the same line: RecallStatus only exists from Hermes v0.21.0
+# (v2026.8.31) onward, and folding it into the import above would make a
+# pre-0.21 host fall through to the MemoryProvider stub -- the provider would
+# then register but never actually subclass the host ABC. Failing over to a
+# local, structurally identical dataclass keeps the recall indicator working on
+# 0.21+ and keeps everything else working on older hosts.
+try:
+    from agent.memory_provider import RecallStatus  # type: ignore[import-not-found]
+except ImportError:  # pragma: no cover - Hermes < 0.21.0, or not installed
+
+    @dataclass(frozen=True)
+    class RecallStatus:  # type: ignore[no-redef]
+        """Fallback mirror of the host dataclass (Hermes >= 0.21.0)."""
+
+        provider_label: str
+        count: int
+        glyph: str = "\U0001f9e0"
+
+
 logger = logging.getLogger("mempalace_sharedbrain.hermes")
 
 _DEFAULT_WING = "hermes"
@@ -48,6 +69,20 @@ _DEFAULT_ROOM = "conversation"
 _REQUEST_TIMEOUT_S = 10.0
 _QUEUE_MAXSIZE = 64
 _MAX_QUERY_CHARS = 250
+
+# Brand mark for the host's deterministic recall indicator, in place of the
+# generic default. The palace is the whole point of the metaphor.
+_MEMPALACE_GLYPH = "\U0001f3db\ufe0f"  # classical building
+_RECALL_LABEL = "MemPalace"
+
+_PREFETCH_HEADER = "Relevant memory from the shared MemPalace hub:"
+
+
+def _format_hits(lines: List[str]) -> str:
+    """Render already-extracted hit texts as the injected prefetch block."""
+    if not lines:
+        return ""
+    return _PREFETCH_HEADER + "\n" + "\n---\n".join(lines)
 
 
 def _config_path(hermes_home: str) -> Path:
@@ -380,7 +415,11 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         self._enable_kg_write = False
         self._enable_coordination = False
         self._active = False
-        self._prefetch_cache: Dict[str, str] = {}
+        # session_id -> (injected text, number of discrete memories in it).
+        # The count rides along with the text so recall_status() can never
+        # disagree with what was actually injected.
+        self._prefetch_cache: Dict[str, Tuple[str, int]] = {}
+        self._last_recall: Optional[RecallStatus] = None
         self._write_queue: "queue.Queue[Dict[str, str]]" = queue.Queue(maxsize=_QUEUE_MAXSIZE)
         self._worker: Optional[threading.Thread] = None
         self._shutdown_event = threading.Event()
@@ -409,6 +448,34 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         self._resolve_config(self._current_hermes_home())
         return bool(self._hub_url and self._token)
 
+    def unavailable_reason(self) -> str:
+        # Resolve fresh rather than trusting is_available() to have run first,
+        # for the same reason get_tool_schemas() does: the host may call this
+        # on a provider instance whose config was never resolved. Only the two
+        # conditions is_available() actually gates on are reported here -- a
+        # reachable-but-wrong hub URL fails at call time, not at this check.
+        self._resolve_config(self._current_hermes_home())
+        missing = []
+        if not self._hub_url:
+            missing.append(
+                "hub_url (set it in $HERMES_HOME/mempalace_sharedbrain.json, "
+                "or the MEMPALACE_HUB_URL env var)"
+            )
+        if not self._token:
+            missing.append(
+                "MEMPALACE_MCP_HTTP_TOKEN (the hub's bearer token, which belongs "
+                "in the gateway's .env, never in the config file)"
+            )
+        if not missing:
+            return ""
+        return (
+            "MemPalace shared brain is missing "
+            + " and ".join(missing)
+            + ". There is no local palace to fall back to, so the provider stays "
+            "off rather than silently answering from nothing. Restart the Hermes "
+            "gateway after fixing this -- config is only read at process start."
+        )
+
     def initialize(self, session_id: str, **kwargs) -> None:
         hermes_home = kwargs.get("hermes_home", "")
         if hermes_home:
@@ -436,7 +503,26 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        return self._prefetch_cache.pop(session_id, "") or self._prefetch_cache.pop("", "")
+        entry = self._prefetch_cache.pop(session_id, None)
+        if entry is None:
+            entry = self._prefetch_cache.pop("", None)
+        text, count = entry if entry else ("", 0)
+        # Set the status on EVERY call, including the miss path. This method is
+        # the only writer, and the host calls it once per turn, so a turn that
+        # recalls nothing actively clears the previous turn's status instead of
+        # leaving recall_status() reporting a stale count.
+        self._last_recall = (
+            RecallStatus(provider_label=_RECALL_LABEL, count=count, glyph=_MEMPALACE_GLYPH)
+            if text
+            else None
+        )
+        return text
+
+    def recall_status(self) -> Optional[RecallStatus]:
+        # count is always >= 1 when this is non-None: the hub returns discrete
+        # drawers, never a synthesized answer, so the host's "injected content
+        # with no discrete count" case (count == 0) cannot arise here.
+        return self._last_recall
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         if not self._active or not query or not self._hub_url:
@@ -451,9 +537,9 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         except Exception:
             logger.debug("mempalace_sharedbrain: prefetch failed", exc_info=True)
             return
-        text = self._format_search_result(result)
-        if text:
-            self._prefetch_cache[session_id or ""] = text
+        lines = self._search_hit_texts(result)
+        if lines:
+            self._prefetch_cache[session_id or ""] = (_format_hits(lines), len(lines))
 
     def sync_turn(
         self,
@@ -800,17 +886,23 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         except (json.JSONDecodeError, IndexError):
             return texts[0]
 
-    def _format_search_result(self, result: Dict[str, Any]) -> str:
+    def _search_hit_texts(self, result: Dict[str, Any]) -> List[str]:
+        """Extract the non-empty verbatim hit texts from a search result.
+
+        Single source of truth for both the injected prefetch block and the
+        recall count, so the "recalled N memories" indicator can never
+        disagree with how many memories actually went into the prompt.
+        """
         parsed = self._unwrap(result)
         if not isinstance(parsed, dict):
-            return ""
+            return []
         hits = parsed.get("results")
-        if not isinstance(hits, list) or not hits:
-            return ""
-        lines = [h.get("text", "") for h in hits if isinstance(h, dict) and h.get("text")]
-        if not lines:
-            return ""
-        return "Relevant memory from the shared MemPalace hub:\n" + "\n---\n".join(lines)
+        if not isinstance(hits, list):
+            return []
+        return [h.get("text", "") for h in hits if isinstance(h, dict) and h.get("text")]
+
+    def _format_search_result(self, result: Dict[str, Any]) -> str:
+        return _format_hits(self._search_hit_texts(result))
 
     # -- background write worker ----------------------------------------------
 
