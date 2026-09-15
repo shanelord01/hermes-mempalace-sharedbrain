@@ -929,3 +929,8 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                 logger.warning("mempalace_sharedbrain: failed to file drawer", exc_info=True)
             finally:
                 self._write_queue.task_done()
+
+
+def register(ctx) -> None:
+    """Hermes plugin entry point: hand the provider to the host."""
+    ctx.register_memory_provider(MempalaceSharedBrainProvider())
