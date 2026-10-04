@@ -454,7 +454,7 @@ _BRIDGE_TOOL_NAMES = {schema["name"] for schema in _BRIDGE_TOOL_SCHEMAS}
 # turn confirmed, so a dropped delivery is shown again rather than lost.
 # ---------------------------------------------------------------------------
 
-_PLUGIN_VERSION = "1.2.0"
+_PLUGIN_VERSION = "1.2.1"
 _PLUGIN_KIND = "hermes"
 _BRIDGE_MARKER = "[mempalace bridge]"
 _BRIDGE_MARKER_RE = re.compile(r"^\[mempalace bridge\] delivery (d[0-9a-f]{6,32})", re.MULTILINE)
@@ -1432,6 +1432,24 @@ _COURIER_SECONDS = 5
 _SURFACE_FORGET_SECONDS = 30 * 86400
 
 
+_PROCESS_ID_ENV = "MEMPALACE_SHAREDBRAIN_PROCESS_ID"
+
+
+def _process_id() -> str:
+    """This process's id in the shared state: hostname, pid and a random token. Containers
+    can share a hostname and reuse pids (the gateway and hermes-webui both report
+    "hermes"), so the token keeps them apart. It is kept in the environment, tied to the
+    pid, so every copy of this module in one process agrees and a child process (the
+    dashboard spawns tui_gateway.entry) never inherits its parent's id."""
+    pid = str(os.getpid())
+    held = os.environ.get(_PROCESS_ID_ENV, "")
+    if held.split(":")[-2:-1] == [pid]:
+        return held
+    fresh = f"{_safe_name(socket.gethostname())}:{pid}:{os.urandom(4).hex()}"
+    os.environ[_PROCESS_ID_ENV] = fresh
+    return fresh
+
+
 def _surface_kind(platform: str, chat_type: str) -> str:
     """The surface a session is on, from the memory-provider kwargs ('' = not the person's)."""
     plat = (platform or "").strip().lower()
@@ -1493,21 +1511,39 @@ def _local_turn_kinds() -> List[str]:
 
 def _host_deliver(text: str, key: str, kind: str) -> Any:
     """Start a turn on one surface. True when accepted, "busy" when that chat is mid-turn
-    (try again shortly), False or None when it cannot be done."""
+    (try again shortly), otherwise a string saying why it could not be done."""
     if kind == "webui":
         start = _webui_start_turn()
         if start is None:
-            return None
+            return "hermes-webui is not running in this process"
         try:
             result = start(key, text, source="mempalace_bridge")
-        except Exception:
+        except Exception as exc:
             logger.warning("mempalace_sharedbrain: webui start_session_turn failed", exc_info=True)
-            return False
+            return f"webui start_session_turn raised {type(exc).__name__}: {_clean(exc, 160)}"
         status = result.get("_status") if isinstance(result, dict) else None
         if status == 200:
             return True
-        return "busy" if status == 409 else False
-    return _host_inject(text, key)
+        if status == 409:
+            return "busy"
+        detail = _clean(result.get("error") if isinstance(result, dict) else result, 160)
+        return f"webui start_session_turn answered {status}: {detail}"
+    real = _real_plugin_context(_PLUGIN_CTX)
+    if real is None:
+        return "this process has no Hermes plugin context"
+    if _host_injection_allowed() is False:
+        return "plugins.entries.mempalace-sharedbrain.allow_gateway_injection is not true"
+    manager = getattr(real, "_manager", None)
+    if kind == "dashboard" and not getattr(manager, "has_tui_message_injector", False):
+        return "this process hosts no dashboard chat (no TUI injector)"
+    if kind in ("dm", "thread") and not getattr(manager, "has_gateway_message_injector", False):
+        return "this process is not the messaging gateway (no gateway injector)"
+    if _host_inject(text, key):
+        return True
+    if kind == "dashboard":
+        return ("the dashboard chat with that session is not open in this process "
+                "(closed, still loading, or owned by another tui_gateway process)")
+    return "the gateway refused the injection (see the gateway log for its reason)"
 
 
 def _host_injection_allowed() -> Optional[bool]:
@@ -1554,7 +1590,7 @@ class _Bridge:
         self._poller_handle: Any = None
         self.clock = clock
         self.host = host or settings.get("host_label") or socket.gethostname()
-        self.owner = f"{_safe_name(self.host)}:{os.getpid()}"
+        self.owner = _process_id() if not host else f"{_safe_name(self.host)}:{os.getpid()}:{os.urandom(4).hex()}"
         self._last_check_in = 0.0
         self._announced = False
         self._stop = threading.Event()
@@ -1640,7 +1676,9 @@ class _Bridge:
         that refused in the last ten minutes. A configured bridge_session_key wins."""
         exclude = set(exclude or [])
         live = self.live_kinds(state, now)
-        failed = {k for k, t in state.get("failed_targets", {}).items() if now - float(t) < _TARGET_FAIL_SECONDS}
+        live_hosts = {h for h, v in state.get("hosts", {}).items() if now - float(v.get("seen", 0)) <= _HOST_LIVE_SECONDS}
+        live_hosts.add(self.owner)
+        failed = {k for k, t in state.get("failed_targets", {}).items() if now - _failed_at(t) < _TARGET_FAIL_SECONDS}
         configured = str(self.settings.get("session_key") or "")
         candidates: List[Tuple[float, str, str]] = []
         if configured:
@@ -1656,6 +1694,13 @@ class _Bridge:
         for _, key, kind in sorted(candidates, reverse=True):
             if key in exclude or key in failed or kind not in live:
                 continue
+            host = str((state["surfaces"].get(key) or {}).get("host") or "")
+            if host:
+                # Only the process that runs this chat can start a turn in it (a dashboard
+                # chat lives in its own tui_gateway process, not the dashboard web server).
+                if host not in live_hosts:
+                    continue
+                return {"key": key, "kind": kind, "host": host}
             return {"key": key, "kind": kind}
         return None
 
@@ -2124,6 +2169,8 @@ class _Bridge:
                 target = d.get("target") or {}
                 if target.get("kind") not in kinds:
                     continue
+                if target.get("host") and target["host"] != self.owner:
+                    continue  # that chat runs in another process
                 if d.get("claimed_by") and now - float(d.get("claimed_at", 0)) < 60:
                     continue
                 if float(d.get("busy_until", 0)) > now:
@@ -2162,8 +2209,14 @@ class _Bridge:
 
                 self.state.update(release)
             else:
-                def failed(st, did=did, key=target["key"]):
-                    st["failed_targets"][key] = now
+                reason = result if isinstance(result, str) and result else "the host refused it"
+                logger.warning(
+                    "mempalace_sharedbrain: bridge turn for %s chat %s could not start here (%s): %s",
+                    target["kind"], target["key"], self.owner, reason,
+                )
+
+                def failed(st, did=did, key=target["key"], kind=target["kind"], reason=reason):
+                    st["failed_targets"][key] = {"at": now, "reason": reason, "host": self.owner, "kind": kind}
                     self._retarget(st, did, now)
 
                 self.state.update(failed)
@@ -2203,6 +2256,16 @@ class _Bridge:
                     d.update(via="prompt", status="")
 
         self.state.update(apply)
+
+
+def _failed_at(entry: Any) -> float:
+    """When a target refused: a {"at", "reason", ...} record, or a bare time (1.2.0 state)."""
+    if isinstance(entry, dict):
+        return float(entry.get("at", 0))
+    try:
+        return float(entry)
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _prompt_mail_block(state: Dict[str, Any], me: str, only: Optional[List[str]] = None) -> Tuple[str, List[str]]:
@@ -2946,7 +3009,7 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                 st["foreign"][key] = now
                 st["surfaces"].pop(key, None)
             elif own:
-                st["surfaces"][key] = {"kind": kind, "seen": now}
+                st["surfaces"][key] = {"kind": kind, "seen": now, "host": _process_id()}
             st["surfaces"] = {k: v for k, v in st["surfaces"].items()
                               if now - float(v.get("seen", 0)) < _SURFACE_FORGET_SECONDS}
 

@@ -195,9 +195,13 @@ An automatic turn starts in the chat you used most recently that some running He
 start a turn in. Each surface needs its own process to do it, because Hermes offers no way to start a
 turn in another process:
 
-- **Discord:** the gateway process, through Hermes's plugin message API.
-- **The dashboard chat:** the dashboard process, through the same API, and only while that chat is
-  open in a browser.
+- **Discord:** the gateway process, through Hermes's plugin message API. The gateway can only post
+  the turn as a message from you: it appears in the thread or DM under your own Discord name, with the
+  📨 From line on top saying which agent actually sent it.
+- **The dashboard chat:** the process that runs that chat, through the same API, and only while the
+  chat is open in a browser. A dashboard chat often runs in its own `tui_gateway` process rather than
+  in the dashboard web server, so the plugin remembers which process each chat ran in and only that
+  process starts the turn.
 - **hermes-webui:** the webui process, through webui's own `start_session_turn`. That is a webui
   function, not a Hermes plugin API, so a webui update could change it. It needs the same
   `allow_gateway_injection` consent.
@@ -205,7 +209,10 @@ turn in another process:
 Every one of these processes runs the bridge's delivery loop, and one of them (whichever got there
 first) also reads the hub. They share `$HERMES_HOME/mempalace_sharedbrain/`, so the webui container
 needs the same `HERMES_HOME` as the gateway. If the chosen chat cannot take the turn (the dashboard
-tab closed, the webui container down), the turn moves to the next most recent chat after two minutes.
+tab closed, the webui container down), the turn moves to the next most recent chat: at once when the
+process says why it cannot, after two minutes when no process answers. The reason is logged as a
+warning and kept in the bridge state under `failed_targets`, and that chat is skipped for ten
+minutes.
 If no chat can take it, the mail waits for your next message. A webui chat that is busy is retried a
 few seconds later. Set `bridge_session_key` to pin turns to one chat instead.
 
@@ -224,7 +231,7 @@ The bridge checks in to the presence room (wing `fleet`, room `presence` by defa
 and every 30 minutes: one drawer for this identity, updated in place, whose first two lines read
 
 ```
-identity: unraid-hermes | checked_in 2026-10-04T09:30:00Z | plugin 1.2.0 hermes | listening yes | host unraid | project hermes | bridge act
+identity: unraid-hermes | checked_in 2026-10-04T09:30:00Z | plugin 1.2.1 hermes | listening yes | host unraid | project hermes | bridge act
 bridge-key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... SHA256:<fingerprint>
 ```
 

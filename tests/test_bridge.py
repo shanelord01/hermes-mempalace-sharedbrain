@@ -914,8 +914,9 @@ class SurfaceTests(BridgeTestCase):
             self.assertTrue(plugin._host_deliver("text", "abcdef123456", "webui"))
             fake.start_session_turn = lambda sid, msg, **kw: {"_status": 409}
             self.assertEqual(plugin._host_deliver("text", "abcdef123456", "webui"), "busy")
-            fake.start_session_turn = lambda sid, msg, **kw: {"_status": 404}
-            self.assertFalse(plugin._host_deliver("text", "abcdef123456", "webui"))
+            fake.start_session_turn = lambda sid, msg, **kw: {"_status": 404, "error": "Session not found"}
+            self.assertEqual(plugin._host_deliver("text", "abcdef123456", "webui"),
+                             "webui start_session_turn answered 404: Session not found")
         self.assertEqual(calls, [("abcdef123456", {"source": "mempalace_bridge"})])
         with mock.patch.dict(sys.modules, {"api.routes": None}):
             self.assertNotIn("webui", plugin._local_turn_kinds())
@@ -985,6 +986,110 @@ class SurfaceTests(BridgeTestCase):
         self.bridge(owner_ids=[]).check_in()
         content = next(iter(self.hub.drawers.values()))["content"]
         self.assertIn("bridge_owner_ids is empty", content)
+
+    def test_dashboard_turn_goes_to_the_process_that_owns_the_chat(self):
+        """Live 1.2.0: the dashboard web server and the per-chat tui_gateway.entry process both
+        host a TUI injector; only the second holds the chat. The web server must not take it."""
+        self.trust_peer()
+        web_server, chat_process = "hermes:152:aaaa1111", "hermes:420:bbbb2222"
+        self.store.update(lambda st: st["hosts"].update({
+            web_server: {"kinds": ["dashboard"], "seen": self.clock.now},
+            chat_process: {"kinds": ["dashboard"], "seen": self.clock.now}}))
+        self.store.update(lambda st: st["surfaces"].update({"20261005_000239_866e65": {
+            "kind": "dashboard", "seen": self.clock.now - 5, "host": chat_process}}))
+        self.task()
+        gateway = self.bridge(session_key="")
+        gateway.kinds = lambda: ["dm", "thread"]
+        gateway.poll()
+        delivery = next(iter(self.state()["deliveries"].values()))
+        self.assertEqual(delivery["target"]["host"], chat_process)
+        server = self.bridge(session_key="")
+        server.kinds, server.owner = (lambda: ["dashboard"]), web_server
+        server.deliver_pending(self.clock.now)
+        self.assertEqual(self.injected, [])  # the web server leaves it alone
+        chat = self.bridge(session_key="")
+        chat.kinds, chat.owner = (lambda: ["dashboard"]), chat_process
+        chat.deliver_pending(self.clock.now)
+        self.assertEqual(self.injected[-1][1], "20261005_000239_866e65")
+        self.assertEqual(next(iter(self.state()["deliveries"].values()))["status"], "injected")
+
+    def test_chat_whose_process_ended_is_skipped(self):
+        self.trust_peer()
+        self.surfaces(**{"agent:main:discord:thread:9:9": ("thread", 300)})
+        self.store.update(lambda st: st["surfaces"].update({"20261005_000239_866e65": {
+            "kind": "dashboard", "seen": self.clock.now - 5, "host": "hermes:420:gone"}}))
+        self.task()
+        self.bridge(session_key="").poll()
+        self.assertEqual(self.injected[-1][1], "agent:main:discord:thread:9:9")
+
+    def test_refusal_reason_is_recorded_and_logged(self):
+        self.trust_peer()
+        self.surfaces(**{"20261005_000239_866e65": ("dashboard", 5), "agent:main:discord:thread:9:9": ("thread", 300)})
+        reason = "the dashboard chat with that session is not open in this process"
+
+        def inject(text, key, kind=None):
+            self.injected.append((text, key))
+            return reason if kind == "dashboard" else True
+
+        self.task()
+        bridge = self.bridge(session_key="")
+        bridge.inject = inject
+        with self.assertLogs("mempalace_sharedbrain.hermes", level="WARNING") as logs:
+            bridge.poll()
+        self.assertIn(reason, "".join(logs.output))
+        failed = self.state()["failed_targets"]["20261005_000239_866e65"]
+        self.assertEqual((failed["reason"], failed["kind"], failed["host"]), (reason, "dashboard", bridge.owner))
+        self.assertEqual(self.injected[-1][1], "agent:main:discord:thread:9:9")
+        self.assertFalse(bridge.pick_target(self.state(), self.clock.now, exclude=["agent:main:discord:thread:9:9"]))
+
+    def test_old_bare_failure_times_still_read(self):
+        self.surfaces(**{"abcdef123456": ("webui", 5)})
+        self.store.update(lambda st: st["failed_targets"].update({"abcdef123456": self.clock.now}))
+        self.assertIsNone(self.bridge(session_key="").pick_target(self.state(), self.clock.now))
+
+    def test_process_ids_are_unique_across_containers_and_children(self):
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop(plugin._PROCESS_ID_ENV, None)
+            first = plugin._process_id()
+            self.assertEqual(plugin._process_id(), first)  # stable within a process
+            self.assertRegex(first, r"^[A-Za-z0-9_.-]+:\d+:[0-9a-f]{8}$")
+            # A child inherits the environment but has another pid: it mints its own.
+            os.environ[plugin._PROCESS_ID_ENV] = "hermes:1:deadbeef"
+            child = plugin._process_id()
+            self.assertNotEqual(child, "hermes:1:deadbeef")
+            self.assertTrue(child.split(":")[1] == str(os.getpid()))
+            # Same hostname and pid in two containers still differ by the token.
+            os.environ.pop(plugin._PROCESS_ID_ENV)
+            self.assertNotEqual(plugin._process_id().split(":")[2], child.split(":")[2])
+
+    def test_recorded_surface_carries_this_process(self):
+        dash = self.dashboard()
+        self.person_says(dash, "hi")
+        self.assertEqual(self.state()["surfaces"]["20261004_101500_a1b2c3"]["host"], plugin._process_id())
+
+    def test_host_deliver_reasons(self):
+        class Manager:
+            has_gateway_message_injector = False
+            has_tui_message_injector = False
+
+        class Real:
+            _manager = Manager()
+
+            def inject_message(self, *a, **k):
+                return False
+
+            def _gateway_injection_allowed(self):
+                return True
+
+        with mock.patch.object(plugin, "_PLUGIN_CTX", Real()):
+            self.assertIn("no TUI injector", plugin._host_deliver("t", "k", "dashboard"))
+            self.assertIn("not the messaging gateway", plugin._host_deliver("t", "k", "dm"))
+            Manager.has_tui_message_injector = True
+            self.assertIn("not open in this process", plugin._host_deliver("t", "k", "dashboard"))
+            Real._gateway_injection_allowed = lambda self: False
+            self.assertIn("allow_gateway_injection", plugin._host_deliver("t", "k", "dashboard"))
+        with mock.patch.object(plugin, "_PLUGIN_CTX", None):
+            self.assertIn("no Hermes plugin context", plugin._host_deliver("t", "k", "thread"))
 
     def test_owner_ids_config_round_trips(self):
         provider = make_provider(self.home, bridge_enabled=True, bridge_owner_ids="111, 222,bad id")
