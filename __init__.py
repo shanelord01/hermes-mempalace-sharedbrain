@@ -30,6 +30,7 @@ import os
 import queue
 import re
 import socket
+import sys
 import threading
 import time
 import urllib.error
@@ -453,7 +454,7 @@ _BRIDGE_TOOL_NAMES = {schema["name"] for schema in _BRIDGE_TOOL_SCHEMAS}
 # turn confirmed, so a dropped delivery is shown again rather than lost.
 # ---------------------------------------------------------------------------
 
-_PLUGIN_VERSION = "1.1.2"
+_PLUGIN_VERSION = "1.2.0"
 _PLUGIN_KIND = "hermes"
 _BRIDGE_MARKER = "[mempalace bridge]"
 _BRIDGE_MARKER_RE = re.compile(r"^\[mempalace bridge\] delivery (d[0-9a-f]{6,32})", re.MULTILINE)
@@ -1267,6 +1268,10 @@ class _BridgeState:
         state.setdefault("own_filter", "")
         state.setdefault("seen_sigs", {})
         state.setdefault("drafts", {})
+        state.setdefault("surfaces", {})
+        state.setdefault("foreign", {})
+        state.setdefault("hosts", {})
+        state.setdefault("failed_targets", {})
         state.setdefault("sign_always", {})
         return state
 
@@ -1409,6 +1414,102 @@ def _host_inject(text: str, session_key: str) -> Optional[bool]:
         return False
 
 
+# Surfaces: where the person talks to Hermes. Kinds a server-started turn can reach, and how:
+#   dm, thread  - Discord (or another gateway platform): PluginContext.inject_message, from the
+#                 gateway process (gateway/run_inbound.py _schedule_plugin_message_injection)
+#   dashboard   - the web dashboard chat (platform tui/desktop): inject_message through the TUI
+#                 injector, only from the dashboard process and only while that chat is open
+#                 (tui_gateway/plugin_inject.py inject_tui_session_message)
+#   webui       - hermes-webui and the Hermex app: api.routes.start_session_turn inside the
+#                 webui process (a webui function, not a Hermes plugin API)
+# cli gets mail with the next message only: inject_message there interrupts a running turn.
+_TURN_KINDS = ("dm", "thread", "dashboard", "webui")
+_HOST_LIVE_SECONDS = 90
+_TARGET_WAIT_SECONDS = 120
+_TARGET_FAIL_SECONDS = 10 * 60
+_SHOWN_LEASE_SECONDS = 20 * 60
+_COURIER_SECONDS = 5
+_SURFACE_FORGET_SECONDS = 30 * 86400
+
+
+def _surface_kind(platform: str, chat_type: str) -> str:
+    """The surface a session is on, from the memory-provider kwargs ('' = not the person's)."""
+    plat = (platform or "").strip().lower()
+    chat = (chat_type or "").strip().lower()
+    if plat in ("tui", "desktop"):
+        return "dashboard"
+    if plat == "webui":
+        return "webui"
+    if plat == "cli":
+        return "cli"
+    if plat in ("", "cron", "subagent", "flush", "api_server"):
+        return ""
+    if chat == "dm":
+        return "dm"
+    if chat == "thread":
+        return "thread"
+    if chat in ("group", "channel"):
+        return "group"
+    return ""
+
+
+def _kind_from_key(key: str) -> str:
+    """Kind of a configured bridge_session_key."""
+    if ":dm:" in key:
+        return "dm"
+    if ":thread:" in key:
+        return "thread"
+    if re.fullmatch(r"[0-9a-f]{12}", key):
+        return "webui"
+    if re.match(r"^\d{8}_\d{6}_[0-9a-f]+$", key):
+        return "dashboard"
+    return ""
+
+
+def _webui_start_turn():
+    """hermes-webui's start_session_turn, when this plugin runs inside the webui process.
+    Only looked up in modules already loaded: never imports anything named api."""
+    module = sys.modules.get("api.routes")
+    fn = getattr(module, "start_session_turn", None)
+    return fn if callable(fn) else None
+
+
+def _local_turn_kinds() -> List[str]:
+    """Surface kinds this process can start a turn on right now."""
+    kinds: List[str] = []
+    real = _real_plugin_context(_PLUGIN_CTX)
+    manager = getattr(real, "_manager", None)
+    if manager is not None and _host_injection_allowed() is not False:
+        if getattr(manager, "has_gateway_message_injector", False):
+            kinds += ["dm", "thread"]
+        if getattr(manager, "has_tui_message_injector", False):
+            kinds.append("dashboard")
+    # start_session_turn is not a plugin API, so it takes the same operator consent as
+    # inject_message: plugins.entries.mempalace-sharedbrain.allow_gateway_injection: true.
+    if _webui_start_turn() is not None and _host_injection_allowed() is True:
+        kinds.append("webui")
+    return kinds
+
+
+def _host_deliver(text: str, key: str, kind: str) -> Any:
+    """Start a turn on one surface. True when accepted, "busy" when that chat is mid-turn
+    (try again shortly), False or None when it cannot be done."""
+    if kind == "webui":
+        start = _webui_start_turn()
+        if start is None:
+            return None
+        try:
+            result = start(key, text, source="mempalace_bridge")
+        except Exception:
+            logger.warning("mempalace_sharedbrain: webui start_session_turn failed", exc_info=True)
+            return False
+        status = result.get("_status") if isinstance(result, dict) else None
+        if status == 200:
+            return True
+        return "busy" if status == 409 else False
+    return _host_inject(text, key)
+
+
 def _host_injection_allowed() -> Optional[bool]:
     """plugins.entries.<id>.allow_gateway_injection, when the host lets us ask."""
     real = _real_plugin_context(_PLUGIN_CTX)
@@ -1438,6 +1539,7 @@ class _Bridge:
         clock=time.time,
         host: str = "",
         signer: Optional[_Signer] = None,
+        kinds=None,
     ) -> None:
         self.call = call
         self.signer = signer
@@ -1445,13 +1547,15 @@ class _Bridge:
         self.me = agent_id
         self.settings = settings
         self.state = state
-        self.inject = inject or (lambda text, key: None)
+        self.inject = inject or (lambda text, key, kind=None: None)
         self.injection_allowed = injection_allowed or (lambda: None)
+        # Surface kinds this process can start a turn on (tests: all of them).
+        self.kinds = kinds or (lambda: list(_TURN_KINDS))
+        self._poller_handle: Any = None
         self.clock = clock
         self.host = host or settings.get("host_label") or socket.gethostname()
         self.owner = f"{_safe_name(self.host)}:{os.getpid()}"
         self._last_check_in = 0.0
-        self._inject_failed = False
         self._announced = False
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
@@ -1466,9 +1570,24 @@ class _Bridge:
         self._stop.set()
 
     def _loop(self) -> None:
-        self.run_once()
-        while not self._stop.wait(_BRIDGE_POLL_SECONDS):
-            self.run_once()
+        """Every process with the bridge on runs this: a heartbeat saying which surfaces it
+        can start turns on, delivering turns aimed at those surfaces, and a standing try
+        for the one poller lock (whoever holds it reads the hub)."""
+        next_poll = 0.0
+        while not self._stop.is_set():
+            now = self.clock()
+            try:
+                self.heartbeat(now)
+                self.deliver_pending(now)
+            except Exception:
+                logger.warning("mempalace_sharedbrain: bridge delivery failed", exc_info=True)
+            if now >= next_poll:
+                if self._poller_handle is None:
+                    self._poller_handle = _try_poller_lock(self.state)
+                if self._poller_handle is not None:
+                    self.run_once()
+                next_poll = now + _BRIDGE_POLL_SECONDS
+            self._stop.wait(_COURIER_SECONDS)
 
     def run_once(self) -> None:
         """One cycle. Every step fails open: logged, retried next cycle."""
@@ -1490,20 +1609,62 @@ class _Bridge:
 
     # -- presence -------------------------------------------------------------
 
-    def session_key(self, state: Optional[Dict[str, Any]] = None) -> str:
-        if self.settings.get("session_key"):
-            return str(self.settings["session_key"])
-        return str((state or self.state.read()).get("session_key") or "")
+    @property
+    def host_id(self) -> str:
+        return self.owner
+
+    def heartbeat(self, now: float) -> None:
+        """Record which surfaces this process can start turns on (shared state)."""
+        kinds = sorted(set(self.kinds()))
+
+        def apply(st):
+            hosts = {k: v for k, v in st["hosts"].items() if now - float(v.get("seen", 0)) < 600}
+            if kinds:
+                hosts[self.host_id] = {"kinds": kinds, "seen": now}
+            else:
+                hosts.pop(self.host_id, None)
+            st["hosts"] = hosts
+
+        self.state.update(apply)
+
+    def live_kinds(self, state: Dict[str, Any], now: float) -> set:
+        live = set(self.kinds())
+        for host in state.get("hosts", {}).values():
+            if now - float(host.get("seen", 0)) <= _HOST_LIVE_SECONDS:
+                live |= set(host.get("kinds") or [])
+        return live
+
+    def pick_target(self, state: Dict[str, Any], now: float, exclude: Optional[List[str]] = None) -> Optional[Dict[str, str]]:
+        """The surface for an automatic turn: the one the person used most recently that some
+        live process can start a turn on, skipping chats where others took part and targets
+        that refused in the last ten minutes. A configured bridge_session_key wins."""
+        exclude = set(exclude or [])
+        live = self.live_kinds(state, now)
+        failed = {k for k, t in state.get("failed_targets", {}).items() if now - float(t) < _TARGET_FAIL_SECONDS}
+        configured = str(self.settings.get("session_key") or "")
+        candidates: List[Tuple[float, str, str]] = []
+        if configured:
+            kind = (state["surfaces"].get(configured) or {}).get("kind") or _kind_from_key(configured)
+            candidates.append((float("inf"), configured, kind))
+        else:
+            for key, surface in state["surfaces"].items():
+                if surface.get("kind") in _TURN_KINDS and key not in state["foreign"]:
+                    candidates.append((float(surface.get("seen", 0)), key, surface["kind"]))
+            legacy = str(state.get("session_key") or "")
+            if legacy and legacy not in state["surfaces"] and _kind_from_key(legacy):
+                candidates.append((0.0, legacy, _kind_from_key(legacy)))
+        for _, key, kind in sorted(candidates, reverse=True):
+            if key in exclude or key in failed or kind not in live:
+                continue
+            return {"key": key, "kind": kind}
+        return None
 
     def listening(self) -> bool:
-        """True only when new mail would start a turn within a minute: mode not off, a
-        session to start it in, a host context to start it with, the host permission
-        not known to be off, and the last attempt not refused."""
-        if self.settings["mode"] == "off" or not self.session_key() or self._inject_failed:
+        """True when new mail would start a turn within about a minute somewhere the person
+        talks to Hermes."""
+        if self.settings["mode"] == "off":
             return False
-        if _real_plugin_context(_PLUGIN_CTX) is None and self.inject is _host_inject:
-            return False
-        return self.injection_allowed() is not False
+        return self.pick_target(self.state.read(), self.clock()) is not None
 
     def check_in(self) -> None:
         now = self.clock()
@@ -1511,6 +1672,9 @@ class _Bridge:
             [
                 _check_in_line(self.me, now, self.listening(), self.host, self.settings["mode"]),
                 self._key_line(),
+                *([] if self.settings.get("owner_ids") else [
+                    "gateway chats: bridge_owner_ids is empty, so Discord and other gateway chats get bridge "
+                    "mail only if <PLATFORM>_ALLOWED_USERS names exactly one user"]),
                 "Agent check-in (mempalace-sharedbrain presence): which agents are on the hub and "
                 "which identity to send work to. Updated in place while the Hermes gateway runs.",
             ]
@@ -1766,6 +1930,8 @@ class _Bridge:
                 st["closures_reported"] = (st["closures_reported"] + newly_reported)[-200:]
 
         self.state.update(apply)
+        self.deliver_pending(now)
+        self._retarget_stale(now)
         self._redeliver_stale(now)
 
     def _dispatch(self, mail: List[Dict[str, Any]], notes: List[str], now: float, settled: set) -> None:
@@ -1791,7 +1957,7 @@ class _Bridge:
         prompt_notes = list(notes)
         if mode == "off":
             held_items, turn_items = held_items + turn_items, []
-        key = self.session_key(state)
+        target = self.pick_target(state, now) if turn_items else None
         if turn_items:
             threads = sorted({i["thread"] for i in turn_items})
             verdict = _turn_check(state, threads, int(self.settings["max_turns_per_hour"]), now)
@@ -1807,7 +1973,7 @@ class _Bridge:
 
                     self.state.update(note_hourly)
                 held_items, turn_items = held_items + turn_items, []
-            elif not key:
+            elif target is None:
                 held_items, turn_items = held_items + turn_items, []
 
         if turn_items:
@@ -1815,29 +1981,25 @@ class _Bridge:
             last = _turn_last_threads(state, threads, int(self.settings["max_turns_per_thread"]))
             delivery_id = "d" + os.urandom(6).hex()
             text = self._turn_text(delivery_id, turn_items, notes, last)
-            accepted = self.inject(text, key)
-            if accepted:
-                self._inject_failed = False
 
-                def commit(st):
-                    _turn_commit(st, threads, int(self.settings["max_turns_per_thread"]), now)
-                    st["deliveries"][delivery_id] = {
-                        "via": "turn",
-                        "events": [i["id"] for i in turn_items],
-                        "items": turn_items,
-                        "notes": notes,
-                        "created": now,
-                    }
+            def commit(st):
+                # Counted when aimed, so the limits hold even while a delivery waits for a surface.
+                _turn_commit(st, threads, int(self.settings["max_turns_per_thread"]), now)
+                st["deliveries"][delivery_id] = {
+                    "via": "turn",
+                    "status": "pending",
+                    "target": target,
+                    "targeted_at": now,
+                    "tried": [],
+                    "text": text,
+                    "events": [i["id"] for i in turn_items],
+                    "items": turn_items,
+                    "notes": notes,
+                    "created": now,
+                }
 
-                self.state.update(commit)
-                prompt_notes = [n for n in prompt_notes if n not in notes]
-                for item in turn_items:
-                    if item["level"] == "act":
-                        self._receipt(item["id"])
-            else:
-                if accepted is False:
-                    self._inject_failed = True
-                held_items = held_items + turn_items
+            self.state.update(commit)
+            prompt_notes = [n for n in prompt_notes if n not in notes]
 
         if held_items or prompt_notes:
             delivery_id = "d" + os.urandom(6).hex()
@@ -1948,22 +2110,105 @@ class _Bridge:
             )
         return "\n".join(lines)
 
+    def deliver_pending(self, now: float) -> None:
+        """Start the turns aimed at surfaces this process can reach. Runs in every process."""
+        kinds = set(self.kinds())
+        if not kinds:
+            return
+
+        def claim(st):
+            out = []
+            for did, d in st["deliveries"].items():
+                if d.get("via") != "turn" or d.get("status") != "pending":
+                    continue
+                target = d.get("target") or {}
+                if target.get("kind") not in kinds:
+                    continue
+                if d.get("claimed_by") and now - float(d.get("claimed_at", 0)) < 60:
+                    continue
+                if float(d.get("busy_until", 0)) > now:
+                    continue
+                d["claimed_by"], d["claimed_at"] = self.owner, now
+                out.append((did, dict(d)))
+            return out
+
+        # A refused target is re-aimed at the next surface, which may also be served here.
+        for _ in range(len(_TURN_KINDS) + 1):
+            claimed = self.state.update(claim)
+            if not claimed:
+                return
+            self._deliver_claimed(claimed, now)
+
+    def _deliver_claimed(self, claimed: List[Tuple[str, Dict[str, Any]]], now: float) -> None:
+        for did, d in claimed:
+            target = d["target"]
+            result = self.inject(d["text"], target["key"], target["kind"])
+            if result is True:
+                def done(st, did=did, key=target["key"]):
+                    entry = st["deliveries"].get(did)
+                    if entry:
+                        entry.update(status="injected", injected_at=now, claimed_by="")
+                    st["failed_targets"].pop(key, None)
+
+                self.state.update(done)
+                for item in d.get("items", []):
+                    if item.get("level") == "act":
+                        self._receipt(item["id"])
+            elif result == "busy":
+                def release(st, did=did):
+                    entry = st["deliveries"].get(did)
+                    if entry:
+                        entry.update(claimed_by="", busy_until=now + _COURIER_SECONDS)
+
+                self.state.update(release)
+            else:
+                def failed(st, did=did, key=target["key"]):
+                    st["failed_targets"][key] = now
+                    self._retarget(st, did, now)
+
+                self.state.update(failed)
+
+    def _retarget(self, st: Dict[str, Any], did: str, now: float) -> None:
+        """Aim a delivery at the next surface, or leave it for the person's next message."""
+        d = st["deliveries"].get(did)
+        if not d:
+            return
+        d["tried"] = list(d.get("tried", [])) + [(d.get("target") or {}).get("key", "")]
+        nxt = self.pick_target(st, now, exclude=d["tried"])
+        if nxt:
+            d.update(target=nxt, targeted_at=now, claimed_by="")
+        else:
+            d.update(via="prompt", status="", claimed_by="")
+
+    def _retarget_stale(self, now: float) -> None:
+        """A pending turn no process took within two minutes (the dashboard chat closed, a
+        webui container down) moves on to the next surface, then to the next message."""
+
+        def apply(st):
+            for did, d in list(st["deliveries"].items()):
+                if d.get("via") == "turn" and d.get("status") == "pending" \
+                        and now - float(d.get("targeted_at", now)) >= _TARGET_WAIT_SECONDS:
+                    self._retarget(st, did, now)
+
+        self.state.update(apply)
+
     def _redeliver_stale(self, now: float) -> None:
-        """A turn delivery that no finished turn confirmed within 20 minutes waits for
-        the next prompt instead, so it is shown again rather than lost."""
+        """A started turn that no finished turn confirmed within 20 minutes waits for the
+        next prompt instead, so it is shown again rather than lost."""
 
         def apply(st):
             for d in st["deliveries"].values():
-                if d.get("via") == "turn" and now - float(d.get("created", now)) >= _REDELIVER_AFTER_SECONDS:
-                    d["via"] = "prompt"
+                if d.get("via") == "turn" and d.get("status", "injected") == "injected" \
+                        and now - float(d.get("injected_at", d.get("created", now))) >= _REDELIVER_AFTER_SECONDS:
+                    d.update(via="prompt", status="")
 
         self.state.update(apply)
 
 
-def _prompt_mail_block(state: Dict[str, Any], me: str) -> Tuple[str, List[str]]:
+def _prompt_mail_block(state: Dict[str, Any], me: str, only: Optional[List[str]] = None) -> Tuple[str, List[str]]:
     """Text for the deliveries waiting for the person's prompt, and their ids."""
     waiting = [(k, d) for k, d in sorted(state["deliveries"].items(), key=lambda kv: kv[1].get("created", 0))
-               if d.get("via") == "prompt"]
+               if d.get("via") == "prompt" and (only is None or k in only)]
     if not waiting:
         return "", []
     lines = [
@@ -1989,11 +2234,64 @@ def _prompt_mail_block(state: Dict[str, Any], me: str) -> Tuple[str, List[str]]:
     return "\n".join(lines), [k for k, _ in waiting]
 
 
+def _claim_prompt_mail(state: Dict[str, Any], session: str, now: float) -> List[str]:
+    """Prompt deliveries this session may show now, marked as shown here. One shown on
+    another surface in the last 20 minutes and not yet confirmed is left alone, so mail
+    appears once across surfaces; unconfirmed after that, it may be shown again."""
+    ids = []
+    for did, d in state["deliveries"].items():
+        if d.get("via") != "prompt":
+            continue
+        shown = d.get("shown") or {}
+        if shown.get("session") and shown.get("session") != session \
+                and now - float(shown.get("at", 0)) < _SHOWN_LEASE_SECONDS:
+            continue
+        d["shown"] = {"session": session, "at": now}
+        ids.append(did)
+    return ids
+
+
 def _confirm_deliveries(state: Dict[str, Any], delivery_ids: List[str]) -> None:
     for did in delivery_ids:
         d = state["deliveries"].pop(did, None)
         if d:
             state["delivered"] = list(dict.fromkeys(state["delivered"] + list(d.get("events", []))))
+
+
+_WARNED_NO_OWNERS: set = set()
+
+
+def _owner_ids(bridge: Dict[str, Any], platform: str) -> set:
+    """Who counts as the person in gateway chats. bridge_owner_ids when set. Otherwise
+    Hermes's own allowlist for that platform (<PLATFORM>_ALLOWED_USERS, else
+    GATEWAY_ALLOWED_USERS, read by gateway/authz_mixin.py _principal_authorized), but only
+    when it names exactly one user: with several allowed users nobody can tell which one is
+    the person. Empty means gateway chats get no bridge mail and no turns."""
+    configured = set(bridge.get("owner_ids") or [])
+    if configured:
+        return configured
+    for name in (f"{(platform or '').upper()}_ALLOWED_USERS", "GATEWAY_ALLOWED_USERS"):
+        ids = [v for v in re.split(r"[,\s]+", os.environ.get(name, "")) if v and v != "*"]
+        if ids:
+            return set(ids) if len(ids) == 1 else set()
+    return set()
+
+
+def _warn_no_owners(platform: str) -> None:
+    if platform in _WARNED_NO_OWNERS:
+        return
+    _WARNED_NO_OWNERS.add(platform)
+    logger.warning(
+        "mempalace_sharedbrain: %s chats get no bridge mail or turns: set bridge_owner_ids in "
+        "mempalace_sharedbrain.json to your own %s user id (or have %s_ALLOWED_USERS name only you)",
+        platform, platform, (platform or "platform").upper(),
+    )
+
+
+def _id_list(value: Any) -> List[str]:
+    """A list of user ids from a JSON list or a comma separated string."""
+    items = value if isinstance(value, list) else str(value or "").split(",")
+    return [str(v).strip() for v in items if re.fullmatch(r"[A-Za-z0-9_.:@-]{1,128}", str(v).strip())]
 
 
 def _sign_mode_of(value: Any) -> str:
@@ -2137,27 +2435,23 @@ def _bridge_continue_text(hermes_home: str, agent_id: str, thread: str) -> str:
 
 
 def _ensure_bridge(provider: "MempalaceSharedBrainProvider") -> None:
-    """Start the one bridge poller for this process and HERMES_HOME, if no other
-    process already holds it."""
+    """Start this process's bridge loop (once per process). Every process with the bridge
+    on delivers turns to the surfaces it hosts; whichever holds the poller lock reads the
+    hub, and the others keep trying for it, so the poller moves if its process ends."""
     global _BRIDGE
     with _BRIDGE_GUARD:
         if _BRIDGE is not None:
-            return
-        store = provider._bridge_store()
-        handle = _try_poller_lock(store)
-        if handle is None:
-            logger.info("mempalace_sharedbrain: another process already runs the bridge for %s", provider._agent_id)
             return
         bridge = _Bridge(
             call=provider._call_json,
             agent_id=provider._agent_id,
             settings=dict(provider._bridge),
-            state=store,
-            inject=_host_inject,
+            state=provider._bridge_store(),
+            inject=_host_deliver,
             injection_allowed=_host_injection_allowed,
             signer=provider._signer(),
+            kinds=_local_turn_kinds,
         )
-        bridge._poller_handle = handle  # held for the process lifetime
         _BRIDGE = bridge
     bridge.start()
 
@@ -2468,6 +2762,11 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         self._platform = ""
         self._chat_type = ""
         self._gateway_session_key = ""
+        self._user_id = ""
+        self._turn_author_id = ""
+        self._turn_author_is_bot = False
+        self._surface = ""
+        self._surface_key = ""
         # Per-turn bridge bookkeeping for this session's agent.
         self._turn_from_bridge = False
         self._session_id = ""
@@ -2507,6 +2806,7 @@ class MempalaceSharedBrainProvider(MemoryProvider):
             ),
             "session_key": str(cfg.get("bridge_session_key") or "").strip(),
             "sign_tasks": _sign_mode_of(cfg.get("bridge_sign_tasks")),
+            "owner_ids": _id_list(cfg.get("bridge_owner_ids")),
             "presence_wing": str(cfg.get("presence_wing") or _DEFAULT_PRESENCE_WING),
             "presence_room": str(cfg.get("presence_room") or _DEFAULT_PRESENCE_ROOM),
             "presence_interval_minutes": _int_setting(
@@ -2561,6 +2861,12 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         self._platform = str(kwargs.get("platform") or "")
         self._chat_type = str(kwargs.get("chat_type") or "")
         self._gateway_session_key = str(kwargs.get("gateway_session_key") or "")
+        self._user_id = str(kwargs.get("user_id") or "")
+        self._surface = _surface_kind(self._platform, self._chat_type)
+        # Gateway sessions are keyed by gateway_session_key; dashboard, webui and CLI by their
+        # session id (the dashboard's durable key, the webui session id).
+        self._surface_key = self._gateway_session_key if self._surface in ("dm", "thread", "group") else (
+            self._session_id or self._gateway_session_key)
         # Cron/flush turns are system-generated; writing them would corrupt the
         # shared representation of what the user actually said and decided.
         self._active = kwargs.get("agent_context") not in {"cron", "flush"} and kwargs.get("platform") != "cron"
@@ -2580,36 +2886,71 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         return _BridgeState(self._hermes_home or self._current_hermes_home(), self._agent_id)
 
     def _bridge_on_gateway_session(self) -> None:
-        """Learn the person's DM session (where bridge turns start when no
-        bridge_session_key is configured) and start the process-wide poller.
-
-        Hermes builds a memory provider per session agent and offers no
-        gateway-startup hook to a memory provider, so the poller starts with the
-        first gateway conversation after a restart. CLI, cron and subagent runs
-        never start it: a short-lived process must not claim to be listening.
-        """
+        """Start this process's bridge loop. Hermes builds a memory provider per session and
+        gives memory providers no start-up hook, so it starts with the first conversation in
+        a long-lived process: the gateway, the dashboard, or hermes-webui. CLI, cron and
+        subagent runs never start it."""
         if self._platform in _GATEWAY_SKIP_PLATFORMS or not self._hub_url or not self._token:
             return
-        if self._chat_type == "dm" and self._gateway_session_key and not self._bridge["session_key"]:
-            key = self._gateway_session_key
-
-            def learn(state):
-                state["session_key"] = key
-
-            self._bridge_store().update(learn)
         _ensure_bridge(self)
 
-    def _may_receive_mail(self) -> bool:
-        """Mail waiting for a prompt goes only to the person's own session, never to a
-        group chat the gateway also serves."""
-        if not self._bridge_enabled or not self._active:
-            return False
-        if self._platform == "cli":
+    def _is_own_session(self, author_id: str = "") -> bool:
+        """Whether this chat is the person's own, so bridge mail may appear in it.
+
+        dashboard, webui, cli: always. Hermes passes platform "tui"/"desktop" only from the
+        dashboard's own chat, "webui" only from hermes-webui and "cli" only from a terminal,
+        all reached only by the operator (behind the dashboard login, the webui password, a
+        shell), so they need no owner id.
+        dm, thread: fail closed. Only when the chat's user is an owner (_owner_ids) and, for a
+        thread, nobody else (no other user, no bot) has spoken there. A channel never counts:
+        Discord keys channel sessions per user, so other speakers there are invisible.
+        """
+        kind = self._surface
+        if kind in ("dashboard", "webui", "cli"):
             return True
-        target = self._bridge["session_key"] or str(self._bridge_store().read().get("session_key") or "")
-        if target:
-            return self._gateway_session_key == target
-        return self._chat_type == "dm"
+        if kind not in ("dm", "thread"):
+            return False
+        owners = _owner_ids(self._bridge, self._platform)
+        if not owners:
+            _warn_no_owners(self._platform)
+            return False
+        if self._user_id not in owners or (author_id and author_id not in owners):
+            return False
+        return self._surface_key not in self._bridge_store().read()["foreign"]
+
+    def _may_receive_mail(self) -> bool:
+        """Mail waiting for a prompt goes to any of the person's own sessions, never to a
+        chat where other people take part."""
+        if not self._bridge_enabled or not self._active or not self._surface_key:
+            return False
+        if self._turn_author_is_bot:
+            return False  # bots never count
+        try:
+            return self._is_own_session(self._turn_author_id)
+        except Exception:
+            logger.debug("mempalace_sharedbrain: bridge state unreadable", exc_info=True)
+            return False
+
+    def _note_turn(self, author_id: str, author_is_bot: bool) -> None:
+        """Remember where the person talks (for automatic turns), and any chat where someone
+        else has spoken (never used for mail again)."""
+        if not self._bridge_enabled or not self._active or not self._surface or not self._surface_key:
+            return
+        owners = _owner_ids(self._bridge, self._platform) if self._surface in ("dm", "thread", "group") else set()
+        key, kind, now = self._surface_key, self._surface, time.time()
+        stranger = bool(author_is_bot) or bool(author_id and author_id not in owners and kind in ("dm", "thread", "group"))
+        own = (not stranger) and self._is_own_session(author_id)
+
+        def apply(st):
+            if stranger and kind in ("thread", "group"):
+                st["foreign"][key] = now
+                st["surfaces"].pop(key, None)
+            elif own:
+                st["surfaces"][key] = {"kind": kind, "seen": now}
+            st["surfaces"] = {k: v for k, v in st["surfaces"].items()
+                              if now - float(v.get("seen", 0)) < _SURFACE_FORGET_SECONDS}
+
+        self._bridge_store().update(apply)
 
     def system_prompt_block(self) -> str:
         if not self._active:
@@ -2648,7 +2989,10 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         if not self._may_receive_mail():
             return ""
         try:
-            block, ids = _prompt_mail_block(self._bridge_store().read(), self._agent_id)
+            session, now = self._surface_key, time.time()
+            store = self._bridge_store()
+            ids = store.update(lambda st: _claim_prompt_mail(st, session, now))
+            block, ids = _prompt_mail_block(store.read(), self._agent_id, only=ids) if ids else ("", [])
         except Exception:
             logger.debug("mempalace_sharedbrain: reading bridge mail failed", exc_info=True)
             return ""
@@ -2660,6 +3004,19 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         self._turn_from_bridge = bool(match)
         self._turn_delivery_id = match.group(1) if match else ""
         self._prompt_deliveries = []
+        self._turn_author_id = str(kwargs.get("author_id") or "")
+        self._turn_author_is_bot = bool(kwargs.get("author_is_bot"))
+        if not match:
+            try:
+                self._note_turn(str(kwargs.get("author_id") or ""), bool(kwargs.get("author_is_bot")))
+            except Exception:
+                logger.debug("mempalace_sharedbrain: noting the surface failed", exc_info=True)
+
+    def on_session_switch(self, new_session_id: str, **kwargs) -> None:
+        """/new, /resume, compression: the dashboard and webui key their chat by session id."""
+        self._session_id = str(new_session_id or "")
+        if self._surface in ("dashboard", "webui", "cli") and new_session_id:
+            self._surface_key = str(new_session_id)
 
     def _confirm_turn(self, user_content: str) -> bool:
         """Confirm the deliveries this finished turn carried. True for a bridge turn."""
@@ -3036,6 +3393,10 @@ class MempalaceSharedBrainProvider(MemoryProvider):
 
     def shutdown(self) -> None:
         self._shutdown_event.set()
+        try:
+            self._write_queue.put_nowait(None)  # wake the writer now rather than at its next poll
+        except queue.Full:
+            pass
         if self._worker:
             self._worker.join(timeout=5.0)
 
@@ -3170,10 +3531,21 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                 "default": self._sign_mode,
             },
             {
+                "key": "bridge_owner_ids",
+                "description": (
+                    "Your own user ids on gateway platforms (your Discord user id), comma separated. "
+                    "Bridge mail then also appears in Discord threads where only you have spoken, and "
+                    "direct messages count only when they are yours. Empty: direct messages count, threads "
+                    "do not. The dashboard, hermes-webui and the CLI always count." + _RESTART_NOTE
+                ),
+                "default": ", ".join(self._bridge.get("owner_ids", [])),
+            },
+            {
                 "key": "bridge_session_key",
                 "description": (
-                    "Gateway session that bridge turns start in, e.g. agent:main:telegram:dm:123456789. "
-                    "Empty: the most recent direct-message session with this gateway." + _RESTART_NOTE
+                    "Pin automatic bridge turns to one chat, e.g. agent:main:discord:dm:123456789. Empty "
+                    "(recommended): the chat you used most recently on any surface that can take a "
+                    "server-started turn." + _RESTART_NOTE
                 ),
                 "default": self._bridge.get("session_key", ""),
             },
@@ -3221,6 +3593,7 @@ class MempalaceSharedBrainProvider(MemoryProvider):
             ),
             "bridge_session_key": str(values.get("bridge_session_key") or "").strip(),
             "bridge_sign_tasks": _sign_mode_of(values.get("bridge_sign_tasks")),
+            "bridge_owner_ids": _id_list(values.get("bridge_owner_ids")),
             "presence_wing": values.get("presence_wing") or _DEFAULT_PRESENCE_WING,
             "presence_room": values.get("presence_room") or _DEFAULT_PRESENCE_ROOM,
             "presence_interval_minutes": _int_setting(
@@ -3331,6 +3704,9 @@ class MempalaceSharedBrainProvider(MemoryProvider):
             try:
                 item = self._write_queue.get(timeout=1.0)
             except queue.Empty:
+                continue
+            if item is None:
+                self._write_queue.task_done()
                 continue
             try:
                 result = self._call_tool(

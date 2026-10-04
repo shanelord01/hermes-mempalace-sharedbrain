@@ -73,7 +73,8 @@ echo "MEMPALACE_MCP_HTTP_TOKEN=<hub bearer token>" >> ~/.hermes/.env
 | `bridge_mode` | - | `read` | `act`, `read` or `off` |
 | `bridge_max_turns_per_hour` | - | `12` | Most automatic turns the bridge starts in an hour |
 | `bridge_max_turns_per_thread` | - | `4` | Most automatic turns on one thread before it pauses for you |
-| `bridge_session_key` | - | (learned) | Gateway session bridge turns start in |
+| `bridge_owner_ids` | - | `[]` | Your own user ids on gateway platforms (your Discord user id) |
+| `bridge_session_key` | - | (most recent chat) | Pin automatic bridge turns to one chat |
 | `bridge_sign_tasks` | - | `session` | When an outgoing task is signed: `session`, `ask` or `auto` |
 | `presence_wing` | - | `fleet` | Wing of the shared presence room |
 | `presence_room` | - | `presence` | Room of the shared presence room |
@@ -127,8 +128,8 @@ another agent's identity on the shared brain.
 
 Agents on one MemPalace hub can send each other work through its event log. With the bridge on,
 Hermes takes part as `agent_id` (for example `unraid-hermes`): a message addressed to it reaches it
-within about a minute and starts a turn in your gateway chat, and a message sent while the gateway
-is down waits on the hub and is picked up when the bridge next starts. The protocol is shared with
+within about a minute and starts a turn in the chat you used most recently, and a message sent while
+Hermes is down waits on the hub and is picked up when the bridge next starts. The protocol is shared with
 the Claude Code plugin and written up in
 [docs/bridge.md](https://github.com/shanelord01/claude-mempalace-sharedbrain/blob/main/docs/bridge.md).
 
@@ -159,15 +160,63 @@ plugins:
       allow_gateway_injection: true
 ```
 
-Then restart the gateway. Bridge turns go to the session named by `bridge_session_key` (a gateway
-session key such as `agent:main:telegram:dm:123456789`). Leave it empty and the plugin uses the
-most recent direct-message conversation with the gateway, so send Hermes one message after
-switching the bridge on. Without the permission or a known session, mail still arrives but waits for
-your next message, and the check-in says `listening no`.
+For Discord (or another gateway platform), also set `bridge_owner_ids` to your own user id there,
+for example `"bridge_owner_ids": ["123456789012345678"]`. Then restart the gateway, the dashboard and
+hermes-webui, and send Hermes one message wherever you use it.
 
-The bridge starts with the first gateway conversation after a restart, because Hermes builds a memory
-provider per conversation and gives memory providers no gateway start-up hook. CLI, cron and
-subagent runs never start it. One process per `HERMES_HOME` runs it, enforced with a lock file.
+### Where bridge mail reaches you
+
+Bridge mail goes only to your own chats, never to a chat with other people in it:
+
+| Where you talk to Hermes | Mail with your next message | Automatic turn when mail arrives |
+|---|---|---|
+| Web dashboard chat | yes | yes, while that chat is open |
+| hermes-webui and the Hermex app | yes | yes |
+| Discord direct message | yes, when your user id is an owner | yes |
+| Discord thread | yes, when you are an owner and nobody else has spoken there | yes |
+| Discord channel outside a thread | no | no |
+| `hermes chat` in a terminal | yes | no |
+
+The dashboard, hermes-webui and the terminal are yours by their nature: Hermes reports them as
+platform `tui`, `webui` and `cli`, which only those programs produce, and only you can reach them.
+Discord chats fail closed. A direct message or thread counts only when its author is an owner:
+someone listed in `bridge_owner_ids`, or, when that is empty, the one user named in
+`DISCORD_ALLOWED_USERS` (or `GATEWAY_ALLOWED_USERS`) if it names exactly one. With neither, Discord
+gets no bridge mail and no turns, and the check-in and the log say to fill in `bridge_owner_ids`. A
+thread where anyone else, or another bot, has spoken is never used again. A channel outside a thread
+never counts, because Hermes keeps one session per person there and the plugin cannot see who else
+is talking.
+
+Mail is shown once. The first of your chats to take a message shows it, and the others leave it
+alone. If that turn never finishes, another chat may show it again after 20 minutes. The inbox moves
+on only after a turn that showed it has finished.
+
+An automatic turn starts in the chat you used most recently that some running Hermes process can
+start a turn in. Each surface needs its own process to do it, because Hermes offers no way to start a
+turn in another process:
+
+- **Discord:** the gateway process, through Hermes's plugin message API.
+- **The dashboard chat:** the dashboard process, through the same API, and only while that chat is
+  open in a browser.
+- **hermes-webui:** the webui process, through webui's own `start_session_turn`. That is a webui
+  function, not a Hermes plugin API, so a webui update could change it. It needs the same
+  `allow_gateway_injection` consent.
+
+Every one of these processes runs the bridge's delivery loop, and one of them (whichever got there
+first) also reads the hub. They share `$HERMES_HOME/mempalace_sharedbrain/`, so the webui container
+needs the same `HERMES_HOME` as the gateway. If the chosen chat cannot take the turn (the dashboard
+tab closed, the webui container down), the turn moves to the next most recent chat after two minutes.
+If no chat can take it, the mail waits for your next message. A webui chat that is busy is retried a
+few seconds later. Set `bridge_session_key` to pin turns to one chat instead.
+
+Hermes's cron jobs are not used. This plugin is switched off inside a cron run, so the run could not
+claim, reply to or close anything, and cron can deliver its output to Discord or the dashboard's bot
+chat but not to hermes-webui.
+
+The bridge starts in each process with the first conversation there after a restart, because Hermes
+builds a memory provider per conversation and gives memory providers no start-up hook. CLI, cron and
+subagent runs never start it. Without the permission, or with no chat that can take a turn, mail
+still arrives with your next message and the check-in says `listening no`.
 
 ### What it does
 
@@ -175,7 +224,7 @@ The bridge checks in to the presence room (wing `fleet`, room `presence` by defa
 and every 30 minutes: one drawer for this identity, updated in place, whose first two lines read
 
 ```
-identity: unraid-hermes | checked_in 2026-10-04T09:30:00Z | plugin 1.1.0 hermes | listening yes | host unraid | project hermes | bridge act
+identity: unraid-hermes | checked_in 2026-10-04T09:30:00Z | plugin 1.2.0 hermes | listening yes | host unraid | project hermes | bridge act
 bridge-key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... SHA256:<fingerprint>
 ```
 
@@ -204,7 +253,7 @@ separate sender field, which is why the sender line is part of the text.
 
 In `read` mode every message is read level. In `off` mode no turn starts and mail waits for your next
 message, as it did before the bridge. Mail that waits reaches the model through the memory prefetch
-of your next message, only in your own direct-message session, never a group chat.
+of your next message, in any of your own chats (see the table above).
 
 Before an act-level turn the bridge takes a lock file for the event, so two processes sharing the
 identity never both act on it, and posts a status-less `received:` ack so the sender knows Hermes

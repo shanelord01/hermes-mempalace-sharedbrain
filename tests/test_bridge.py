@@ -175,7 +175,7 @@ class BridgeTestCase(unittest.TestCase):
         self._tmp.cleanup()
         self._peer_tmp.cleanup()
 
-    def inject(self, text, key):
+    def inject(self, text, key, kind=None):
         self.injected.append((text, key))
         return self.inject_result
 
@@ -223,6 +223,8 @@ def make_provider(home, **cfg):
     provider._resolve_config(home)
     provider._hermes_home = home
     provider._active = True
+    # A CLI session unless a test says otherwise (initialize() sets these from Hermes's kwargs).
+    provider._platform, provider._surface, provider._surface_key = "cli", "cli", "cli-session"
     return provider
 
 
@@ -668,6 +670,331 @@ def _envelope(obj):
     return {"content": [{"type": "text", "text": json.dumps(obj)}], "isError": False}
 
 
+OWNER = "111111111111111111"
+STRANGER = "222222222222222222"
+
+
+class SurfaceTests(BridgeTestCase):
+    """Mail and automatic turns on every surface the person uses (dashboard, hermes-webui and
+    the Hermex app, the CLI, Discord DMs and owner-only Discord threads)."""
+
+    def session(self, platform, *, session_id="s1", chat_type="", key="", user_id="", **cfg):
+        cfg.setdefault("bridge_owner_ids", [OWNER])
+        provider = make_provider(self.home, bridge_enabled=True, **cfg)
+        with mock.patch.object(plugin, "_ensure_bridge"):
+            provider.initialize(session_id, hermes_home=self.home, platform=platform, agent_context="primary",
+                                chat_type=chat_type, gateway_session_key=key, user_id=user_id)
+        provider._call_tool = lambda *a, **k: {}  # the turn filer never reaches a network
+        self.addCleanup(provider.shutdown)
+        return provider
+
+    def dashboard(self, sid="20261004_101500_a1b2c3"):
+        return self.session("tui", session_id=sid)
+
+    def webui(self, sid="abcdef123456"):
+        return self.session("webui", session_id=sid, key=sid)
+
+    def discord_dm(self, user=OWNER, **cfg):
+        return self.session("discord", chat_type="dm", key=f"agent:main:discord:dm:{user}9", user_id=user, **cfg)
+
+    def discord_thread(self, user=OWNER, thread="555"):
+        return self.session("discord", chat_type="thread", key=f"agent:main:discord:thread:{thread}:{thread}", user_id=user)
+
+    def hold_mail(self):
+        """One message waiting for the person's next message."""
+        self.task(sign=False, to_agent="*", body="hello from another agent")
+        self.bridge(session_key="").poll()
+        return [k for k, d in self.state()["deliveries"].items() if d["via"] == "prompt"]
+
+    def person_says(self, provider, text="what is new?", author=None):
+        provider.on_turn_start(1, text, author_id=author or provider._user_id, author_is_bot=False)
+        return provider.prefetch(text)
+
+    def test_surface_kinds_from_the_kwargs(self):
+        cases = [("tui", "", "dashboard"), ("desktop", "", "dashboard"), ("webui", "", "webui"), ("cli", "", "cli"),
+                 ("discord", "dm", "dm"), ("discord", "thread", "thread"), ("discord", "group", "group"),
+                 ("telegram", "dm", "dm"), ("cron", "", ""), ("api_server", "", ""), ("", "", "")]
+        for platform, chat, kind in cases:
+            self.assertEqual(plugin._surface_kind(platform, chat), kind, (platform, chat))
+
+    def test_mail_reaches_the_dashboard_webui_cli_and_a_discord_dm(self):
+        for make in (self.dashboard, self.webui, lambda: self.session("cli", session_id="c1"), self.discord_dm):
+            os.remove(self.store.path) if self.store.path.exists() else None
+            self.hub.events.clear()
+            self.hold_mail()
+            provider = make()
+            text = self.person_says(provider)
+            self.assertIn("hello from another agent", text, provider._surface)
+            self.assertIn("\U0001f4e8 From", text, provider._surface)
+
+    def test_discord_thread_needs_owner_ids_and_only_the_owner_speaking(self):
+        self.hold_mail()
+        no_owners = self.session("discord", chat_type="thread", key="agent:main:discord:thread:1:1", user_id=OWNER,
+                                 bridge_owner_ids=[])
+        self.assertEqual(self.person_says(no_owners), "")
+        thread = self.discord_thread()
+        self.assertIn("hello from another agent", self.person_says(thread))
+
+    def test_a_thread_where_someone_else_spoke_never_gets_mail_again(self):
+        thread = self.discord_thread(thread="777")
+        self.person_says(thread, "hi")
+        self.assertIn("agent:main:discord:thread:777:777", self.state()["surfaces"])
+        thread.on_turn_start(2, "me too", author_id=STRANGER, author_is_bot=False)
+        self.assertIn("agent:main:discord:thread:777:777", self.state()["foreign"])
+        self.assertNotIn("agent:main:discord:thread:777:777", self.state()["surfaces"])
+        self.hold_mail()
+        self.assertEqual(self.person_says(thread), "")
+        # Another bot speaking counts too.
+        other = self.discord_thread(thread="888")
+        other.on_turn_start(1, "beep", author_id="999", author_is_bot=True)
+        self.assertIn("agent:main:discord:thread:888:888", self.state()["foreign"])
+
+    def test_channels_and_other_peoples_dms_never_get_mail(self):
+        self.hold_mail()
+        channel = self.session("discord", chat_type="group", key=f"agent:main:discord:group:1:{OWNER}", user_id=OWNER)
+        self.assertEqual(self.person_says(channel), "")
+        stranger_dm = self.discord_dm(user=STRANGER)
+        self.assertEqual(self.person_says(stranger_dm), "")
+
+    def test_mail_is_shown_once_across_surfaces_and_again_if_never_confirmed(self):
+        self.hold_mail()
+        dash, phone = self.dashboard(), self.webui()
+        self.assertIn("hello from another agent", self.person_says(dash))
+        self.assertEqual(self.person_says(phone), "")  # already on the dashboard
+        # The dashboard turn finished: confirmed, gone everywhere, and the cursor can move.
+        dash.sync_turn("what is new?", "done")
+        self.assertEqual([d for d in self.state()["deliveries"].values() if d["via"] == "prompt"], [])
+        self.assertEqual(self.person_says(phone), "")
+
+    def test_unconfirmed_showing_lapses_after_twenty_minutes(self):
+        ids = self.hold_mail()
+        dash, phone = self.dashboard(), self.webui()
+        self.person_says(dash)  # shown, but that turn never finished
+        self.store.update(lambda st: st["deliveries"][ids[0]]["shown"].update(at=time.time() - 21 * 60))
+        self.assertIn("hello from another agent", self.person_says(phone))
+
+    def surfaces(self, **seen):
+        """Record the person's recent surfaces: key -> (kind, seconds ago)."""
+        def apply(st):
+            for key, (kind, ago) in seen.items():
+                st["surfaces"][key] = {"kind": kind, "seen": self.clock.now - ago}
+        self.store.update(apply)
+
+    def test_automatic_turn_goes_to_the_most_recent_surface(self):
+        self.trust_peer()
+        self.surfaces(**{"agent:main:discord:dm:19": ("dm", 600), "abcdef123456": ("webui", 60),
+                         "20261004_101500_a1b2c3": ("dashboard", 300)})
+        self.task()
+        self.bridge(session_key="").poll()
+        self.assertEqual(self.injected[-1][1], "abcdef123456")
+
+    def test_turn_waits_for_the_process_that_hosts_the_surface(self):
+        """The poller (here a gateway) cannot reach the dashboard: the dashboard process's
+        loop picks the delivery up from shared state and starts the turn there."""
+        self.trust_peer()
+        self.surfaces(**{"20261004_101500_a1b2c3": ("dashboard", 10)})
+        self.store.update(lambda st: st["hosts"].update({"dash:1": {"kinds": ["dashboard"], "seen": self.clock.now}}))
+        self.task()
+        gateway = self.bridge(session_key="")
+        gateway.kinds = lambda: ["dm", "thread"]
+        gateway.poll()
+        self.assertEqual(self.injected, [])
+        pending = [d for d in self.state()["deliveries"].values() if d.get("status") == "pending"]
+        self.assertEqual(pending[0]["target"], {"key": "20261004_101500_a1b2c3", "kind": "dashboard"})
+        dashboard = self.bridge(session_key="")
+        dashboard.kinds = lambda: ["dashboard"]
+        dashboard.owner = "dash:1"
+        dashboard.deliver_pending(self.clock.now)
+        self.assertEqual(self.injected[-1][1], "20261004_101500_a1b2c3")
+        self.assertEqual([d["status"] for d in self.state()["deliveries"].values()], ["injected"])
+        self.assertEqual(len(self.hub.calls_to("mempalace_event_ack")), 1)  # the received: ack, once
+
+    def test_refused_surface_falls_back_to_the_next_then_to_the_next_message(self):
+        self.trust_peer()
+        self.surfaces(**{"20261004_101500_a1b2c3": ("dashboard", 10), "agent:main:discord:dm:19": ("dm", 500)})
+        refused = []
+
+        def inject(text, key, kind=None):
+            self.injected.append((text, key))
+            if kind == "dashboard":
+                refused.append(key)
+                return False  # that dashboard chat is closed
+            return True
+
+        self.task()
+        bridge = self.bridge(session_key="")
+        bridge.inject = inject
+        bridge.poll()
+        self.assertEqual([k for _, k in self.injected], ["20261004_101500_a1b2c3", "agent:main:discord:dm:19"])
+        # With every surface refusing, the mail waits for the next message instead.
+        os.remove(self.store.path)
+        self.surfaces(**{"20261004_101500_a1b2c3": ("dashboard", 10)})
+        self.task()
+        bridge.poll()
+        vias = [d["via"] for d in self.state()["deliveries"].values()]
+        self.assertEqual(vias, ["prompt"])
+
+    def test_surface_nobody_hosts_moves_on_after_two_minutes(self):
+        self.trust_peer()
+        self.surfaces(**{"abcdef123456": ("webui", 10)})
+        self.store.update(lambda st: st["hosts"].update({"webui:1": {"kinds": ["webui"], "seen": self.clock.now}}))
+        self.task()
+        gateway = self.bridge(session_key="")
+        gateway.kinds = lambda: ["dm", "thread"]
+        gateway.poll()
+        self.clock.now += plugin._TARGET_WAIT_SECONDS + 1
+        gateway.poll()
+        self.assertEqual([d["via"] for d in self.state()["deliveries"].values()], ["prompt"])
+
+    def test_busy_webui_chat_is_retried_not_dropped(self):
+        self.trust_peer()
+        self.surfaces(**{"abcdef123456": ("webui", 10)})
+        self.task()
+        bridge = self.bridge(session_key="")
+        answers = iter(["busy", True])
+        bridge.inject = lambda text, key, kind=None: (self.injected.append((text, key)), next(answers))[1]
+        bridge.poll()
+        self.assertEqual([d["status"] for d in self.state()["deliveries"].values()], ["pending"])
+        self.clock.now += plugin._COURIER_SECONDS
+        bridge.deliver_pending(self.clock.now)
+        self.assertEqual([d["status"] for d in self.state()["deliveries"].values()], ["injected"])
+
+    def test_listening_reflects_reachable_surfaces(self):
+        bridge = self.bridge(session_key="")
+        self.assertFalse(bridge.listening())
+        self.surfaces(**{"abcdef123456": ("webui", 10)})
+        bridge.kinds = lambda: []
+        self.assertFalse(bridge.listening())  # nobody can start a webui turn
+        self.store.update(lambda st: st["hosts"].update({"webui:1": {"kinds": ["webui"], "seen": self.clock.now}}))
+        self.assertTrue(bridge.listening())
+        self.clock.now += plugin._HOST_LIVE_SECONDS + 1
+        self.assertFalse(bridge.listening())  # its heartbeat stopped
+
+    def test_cli_and_foreign_threads_never_get_automatic_turns(self):
+        self.trust_peer()
+        self.surfaces(**{"cli-1": ("cli", 1), "agent:main:discord:thread:7:7": ("thread", 5)})
+        self.store.update(lambda st: st["foreign"].update({"agent:main:discord:thread:7:7": self.clock.now}))
+        self.task()
+        self.bridge(session_key="").poll()
+        self.assertEqual(self.injected, [])
+
+    def test_surfaces_are_recorded_from_the_persons_own_turns_only(self):
+        dash = self.dashboard()
+        self.person_says(dash, "hi")
+        dash.on_turn_start(2, f"{plugin._BRIDGE_MARKER} delivery dabcdef12 for {ME}\nmail")
+        self.assertEqual(self.state()["surfaces"]["20261004_101500_a1b2c3"]["kind"], "dashboard")
+        self.discord_dm(user=STRANGER).on_turn_start(1, "hey", author_id=STRANGER)
+        self.assertNotIn(f"agent:main:discord:dm:{STRANGER}9", self.state()["surfaces"])
+
+    def test_session_switch_follows_the_dashboard_chat(self):
+        dash = self.dashboard()
+        dash.on_session_switch("20261004_120000_ffffff")
+        self.person_says(dash, "hi")
+        self.assertIn("20261004_120000_ffffff", self.state()["surfaces"])
+
+    def test_heartbeat_records_and_forgets_this_process(self):
+        bridge = self.bridge(session_key="")
+        bridge.kinds = lambda: ["webui"]
+        bridge.heartbeat(self.clock.now)
+        self.assertEqual(self.state()["hosts"][bridge.owner]["kinds"], ["webui"])
+        bridge.kinds = lambda: []
+        bridge.heartbeat(self.clock.now)
+        self.assertNotIn(bridge.owner, self.state()["hosts"])
+
+    def test_host_deliver_uses_webui_start_session_turn_when_loaded(self):
+        calls = []
+        fake = type(sys)("api.routes")
+        fake.start_session_turn = lambda sid, msg, **kw: (calls.append((sid, kw)), {"_status": 200})[1]
+        with mock.patch.dict(sys.modules, {"api.routes": fake}):
+            self.assertNotIn("webui", plugin._local_turn_kinds())  # no consent known
+            allowed = mock.patch.object(plugin, "_host_injection_allowed", return_value=True)
+            allowed.start()
+            self.addCleanup(allowed.stop)
+            self.assertIn("webui", plugin._local_turn_kinds())
+            self.assertTrue(plugin._host_deliver("text", "abcdef123456", "webui"))
+            fake.start_session_turn = lambda sid, msg, **kw: {"_status": 409}
+            self.assertEqual(plugin._host_deliver("text", "abcdef123456", "webui"), "busy")
+            fake.start_session_turn = lambda sid, msg, **kw: {"_status": 404}
+            self.assertFalse(plugin._host_deliver("text", "abcdef123456", "webui"))
+        self.assertEqual(calls, [("abcdef123456", {"source": "mempalace_bridge"})])
+        with mock.patch.dict(sys.modules, {"api.routes": None}):
+            self.assertNotIn("webui", plugin._local_turn_kinds())
+
+    def test_local_kinds_follow_the_hosts_injectors(self):
+        class Manager:
+            has_gateway_message_injector = True
+            has_tui_message_injector = False
+
+        class Real:
+            _manager = Manager()
+
+            def inject_message(self, *a, **k):
+                return True
+
+            def _gateway_injection_allowed(self):
+                return True
+
+        with mock.patch.object(plugin, "_PLUGIN_CTX", Real()):
+            self.assertEqual(plugin._local_turn_kinds(), ["dm", "thread"])
+            Manager.has_tui_message_injector = True
+            self.assertEqual(plugin._local_turn_kinds(), ["dm", "thread", "dashboard"])
+            Real._gateway_injection_allowed = lambda self: False
+            self.assertEqual(plugin._local_turn_kinds(), [])
+
+    def test_empty_owner_list_means_a_dm_gets_nothing(self):
+        self.hold_mail()
+        with mock.patch.dict(os.environ, {"DISCORD_ALLOWED_USERS": "", "GATEWAY_ALLOWED_USERS": ""}):
+            dm = self.discord_dm(bridge_owner_ids=[])
+            with self.assertLogs("mempalace_sharedbrain.hermes", level="WARNING") as logs:
+                plugin._WARNED_NO_OWNERS.discard("discord")
+                self.assertEqual(self.person_says(dm), "")
+        self.assertIn("bridge_owner_ids", "".join(logs.output))
+        self.assertEqual(self.state()["surfaces"], {})  # not recorded as a surface either
+
+    def test_unknown_dm_author_gets_nothing_and_is_never_a_surface(self):
+        self.hold_mail()
+        dm = self.discord_dm(user=STRANGER)
+        self.assertEqual(self.person_says(dm), "")
+        self.assertEqual(self.state()["surfaces"], {})
+        # An owner's DM where a stranger is the author of this turn gets nothing either.
+        mine = self.discord_dm()
+        self.assertEqual(self.person_says(mine, author=STRANGER), "")
+
+    def test_listed_owner_gets_mail(self):
+        self.hold_mail()
+        dm = self.discord_dm()
+        self.assertIn("hello from another agent", self.person_says(dm))
+        self.assertEqual(self.state()["surfaces"][dm._surface_key]["kind"], "dm")
+
+    def test_a_bot_never_counts(self):
+        self.hold_mail()
+        dm = self.discord_dm()
+        dm.on_turn_start(1, "beep", author_id=OWNER, author_is_bot=True)
+        self.assertEqual(dm.prefetch("beep"), "")
+        self.assertEqual(self.state()["surfaces"], {})
+
+    def test_single_allowlisted_user_counts_as_owner_but_several_do_not(self):
+        self.hold_mail()
+        with mock.patch.dict(os.environ, {"DISCORD_ALLOWED_USERS": OWNER}):
+            self.assertIn("hello", self.person_says(self.discord_dm(bridge_owner_ids=[])))
+        with mock.patch.dict(os.environ, {"DISCORD_ALLOWED_USERS": f"{OWNER},{STRANGER}"}):
+            self.assertEqual(plugin._owner_ids({"owner_ids": []}, "discord"), set())
+        self.assertEqual(plugin._owner_ids({"owner_ids": ["9"]}, "discord"), {"9"})
+
+    def test_check_in_names_the_setting_when_no_owner_is_set(self):
+        self.bridge(owner_ids=[]).check_in()
+        content = next(iter(self.hub.drawers.values()))["content"]
+        self.assertIn("bridge_owner_ids is empty", content)
+
+    def test_owner_ids_config_round_trips(self):
+        provider = make_provider(self.home, bridge_enabled=True, bridge_owner_ids="111, 222,bad id")
+        self.assertEqual(provider._bridge["owner_ids"], ["111", "222"])
+        schema = {f["key"]: f for f in provider.get_config_schema()}
+        self.assertIn("restart", schema["bridge_owner_ids"]["description"].lower())
+        provider.save_config({"bridge_owner_ids": schema["bridge_owner_ids"]["default"]}, self.home)
+        saved = json.loads((Path(self.home) / "mempalace_sharedbrain.json").read_text())
+        self.assertEqual(saved["bridge_owner_ids"], ["111", "222"])
+
 class SuccessFalseTests(BridgeTestCase):
     """The hub can report failure inside a normal reply: success false, isError false."""
 
@@ -771,25 +1098,17 @@ class ProviderIntegrationTests(BridgeTestCase):
         self.assertNotIn("mail text", filed)
         self.assertIn("did it", filed)
 
-    def test_initialize_learns_the_dm_session_and_skips_cli(self):
+    def test_initialize_starts_the_bridge_in_long_lived_processes_only(self):
         provider = make_provider(self.home, bridge_enabled=True)
         with mock.patch.object(plugin, "_ensure_bridge") as ensure:
-            provider.initialize("s1", hermes_home=self.home, platform="cli", agent_context="primary")
+            for platform in ("cli", "cron"):
+                provider.initialize("s1", hermes_home=self.home, platform=platform, agent_context="primary")
             ensure.assert_not_called()
-            provider.initialize("s2", hermes_home=self.home, platform="telegram", agent_context="primary",
-                                chat_type="dm", gateway_session_key="agent:main:telegram:dm:42")
-            ensure.assert_called_once()
-        self.assertEqual(self.state()["session_key"], "agent:main:telegram:dm:42")
+            for platform, extra in (("discord", {"chat_type": "dm", "gateway_session_key": "agent:main:discord:dm:42"}),
+                                    ("tui", {}), ("webui", {"gateway_session_key": "abcdef123456"})):
+                provider.initialize("s2", hermes_home=self.home, platform=platform, agent_context="primary", **extra)
+            self.assertEqual(ensure.call_count, 3)
         provider.shutdown()
-
-    def test_mail_waiting_for_a_prompt_never_goes_to_a_group_chat(self):
-        provider = make_provider(self.home, bridge_enabled=True)
-        self.store.update(lambda st: st.update(session_key="agent:main:telegram:dm:42"))
-        provider._platform, provider._chat_type = "telegram", "group"
-        provider._gateway_session_key = "agent:main:telegram:group:9"
-        self.assertFalse(provider._may_receive_mail())
-        provider._gateway_session_key = "agent:main:telegram:dm:42"
-        self.assertTrue(provider._may_receive_mail())
 
     def test_diary_agent_name_has_no_colons(self):
         provider = make_provider(self.home, agent_id="host:hermes:x")
