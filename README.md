@@ -28,6 +28,12 @@ To host a hub with per-user OAuth login instead of a shared static token, see
 on the wiki: MemPalace + Qdrant behind Newt/Pangolin with no open inbound ports, Pocket ID as the
 OAuth 2.1 authorization server, and a caddy-jwt container in front of the hub.
 
+Claude Code machines on the same hub:
+[claude-mempalace-sharedbrain](https://github.com/shanelord01/claude-mempalace-sharedbrain) is the
+matching Claude Code plugin. It checks the palace and the task inbox at the start of every
+session, reminds the model to checkpoint, and snapshots the conversation before compaction, so a
+Hermes gateway and your Claude Code sessions share one palace and one logstream.
+
 ## Install
 
 ```bash
