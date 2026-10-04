@@ -231,7 +231,8 @@ class PresenceTests(BridgeTestCase):
         line = plugin._check_in_line(ME, 1_790_000_000.0, True, "unraid", "act")
         self.assertRegex(
             line,
-            r"^identity: unraid-hermes \| checked_in \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \| plugin 1\.1\.0 hermes "
+            r"^identity: unraid-hermes \| checked_in \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ \| plugin "
+        + plugin.re.escape(plugin._PLUGIN_VERSION) + r" hermes "
             r"\| listening yes \| host unraid \| project hermes \| bridge act$",
         )
 
@@ -1539,3 +1540,12 @@ class FenceTests(unittest.TestCase):
         for raw in ("<<<<<", ">>>>>>>>", "a<<<<<<<b", "x>>>>>END OF DATA<<<<<y", "<<<<<<<<<<<<"):
             out = plugin._fence_safe(raw)
             self.assertIsNone(plugin.re.search(r"<{3,}|>{3,}", out), (raw, out))
+
+
+class VersionTests(unittest.TestCase):
+    def test_reported_version_matches_plugin_yaml(self):
+        # The check-in line reports _PLUGIN_VERSION; it must not drift from the manifest again.
+        manifest = (Path(plugin.__file__).parent / "plugin.yaml").read_text()
+        version = plugin.re.search(r"^version:\s*(\S+)", manifest, plugin.re.M).group(1)
+        self.assertEqual(plugin._PLUGIN_VERSION, version)
+

@@ -1,5 +1,5 @@
 name: mempalace-sharedbrain
-version: 1.1.1
+version: 1.1.2
 description: "MemPalace shared-brain hub memory provider - multi-machine, multi-agent shared memory over MCP/HTTP. No local dependencies, no API key required by the plugin itself (the hub holds its own bearer token). Any config change here needs a Hermes gateway restart to take effect - saving alone is not enough."
 external_dependencies: []
 hooks:

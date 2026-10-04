@@ -453,7 +453,7 @@ _BRIDGE_TOOL_NAMES = {schema["name"] for schema in _BRIDGE_TOOL_SCHEMAS}
 # turn confirmed, so a dropped delivery is shown again rather than lost.
 # ---------------------------------------------------------------------------
 
-_PLUGIN_VERSION = "1.1.0"
+_PLUGIN_VERSION = "1.1.2"
 _PLUGIN_KIND = "hermes"
 _BRIDGE_MARKER = "[mempalace bridge]"
 _BRIDGE_MARKER_RE = re.compile(r"^\[mempalace bridge\] delivery (d[0-9a-f]{6,32})", re.MULTILINE)
