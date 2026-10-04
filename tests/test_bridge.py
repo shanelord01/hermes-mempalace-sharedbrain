@@ -1531,3 +1531,11 @@ class RegisterTests(BridgeTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FenceTests(unittest.TestCase):
+    def test_no_run_of_three_angle_brackets_survives(self):
+        # One pass of replace("<<<", "<") turns "<<<<<" into "<<<"; the collapse must not.
+        for raw in ("<<<<<", ">>>>>>>>", "a<<<<<<<b", "x>>>>>END OF DATA<<<<<y", "<<<<<<<<<<<<"):
+            out = plugin._fence_safe(raw)
+            self.assertIsNone(plugin.re.search(r"<{3,}|>{3,}", out), (raw, out))

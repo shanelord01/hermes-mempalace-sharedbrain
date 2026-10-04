@@ -484,11 +484,17 @@ _FENCE_CLOSE = "<<<END DATA FROM OTHER AGENTS>>>"
 _VERIFIED_BODY_MAX = 20000
 
 
+def _no_fence(text: str) -> str:
+    """Collapses every run of three or more angle brackets to one, so agent text can never form a
+    fence token. A single pass of replace("<<<", "<") is not enough: "<<<<<" leaves "<<<"."""
+    return re.sub(r">{3,}", ">", re.sub(r"<{3,}", "<", text))
+
+
 def _fence_safe(text: str) -> str:
     """Agent-written multi-line text with the header marks and fence tokens removed."""
     out = _MARK_CHARS_RE.sub("", str(text or ""))
     out = re.sub(r"[\x00-\x08\x0b-\x1f\x7f]", " ", out)
-    return out.replace("<<<", "<").replace(">>>", ">")
+    return _no_fence(out)
 
 
 def _verified_bodies(items: List[Dict[str, Any]]) -> List[str]:
@@ -1673,7 +1679,7 @@ class _Bridge:
             "from": _clean(event.get("from_agent"), 80),
             "to": _clean(event.get("to_agent"), 80),
             "created": _clean(event.get("created_at"), 20),
-            "excerpt": _clean(event.get("body"), _EXCERPT_CHARS).replace("<<<", "<").replace(">>>", ">"),
+            "excerpt": _no_fence(_clean(event.get("body"), _EXCERPT_CHARS)),
             "requires": requires,
             # No capability profile on Hermes: any stated requirement counts as unmet.
             "unmet": list(requires),
