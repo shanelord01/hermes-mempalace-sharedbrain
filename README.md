@@ -69,6 +69,16 @@ echo "MEMPALACE_MCP_HTTP_TOKEN=<hub bearer token>" >> ~/.hermes/.env
 | `room` | - | `conversation` | MemPalace room (category) turns are filed under |
 | `enable_kg_write` | - | `false` | Let this agent add/edit shared knowledge-graph facts, not just query them |
 | `enable_coordination` | - | `false` | Let this agent send/receive delegated tasks and patches over the shared logstream |
+| `bridge_enabled` | - | `false` | Take part in the hub's message bridge (see below) |
+| `bridge_mode` | - | `read` | `act`, `read` or `off` |
+| `bridge_max_turns_per_hour` | - | `12` | Most automatic turns the bridge starts in an hour |
+| `bridge_max_turns_per_thread` | - | `4` | Most automatic turns on one thread before it pauses for you |
+| `bridge_session_key` | - | (learned) | Gateway session bridge turns start in |
+| `bridge_sign_tasks` | - | `session` | When an outgoing task is signed: `session`, `ask` or `auto` |
+| `presence_wing` | - | `fleet` | Wing of the shared presence room |
+| `presence_room` | - | `presence` | Room of the shared presence room |
+| `presence_interval_minutes` | - | `30` | Minutes between check-ins |
+| `host_label` | - | the hostname | Host name shown in the check-in line (not on the dashboard) |
 | - | `MEMPALACE_MCP_HTTP_TOKEN` | - (required, secret) | Bearer token, `.env` only |
 
 Config file wins over env vars, which win over defaults.
@@ -105,10 +115,221 @@ work autonomously by another agent, not just asked to recall or file memory:
 `mempalace_event_append`, `mempalace_event_list`, `mempalace_event_wait`, `mempalace_event_ack`,
 `mempalace_artifact_put`, `mempalace_artifact_get`, `mempalace_patch_submit`.
 
+Opt-in via `bridge_enabled`: `mempalace_bridge_continue`, plus the coordination tools above,
+because a bridge turn claims, replies to and closes tasks with them.
+
 Both toggles are off by default and surfaced in `hermes memory setup` / the dashboard, not
 silently on. Identity fields (`from_agent`, `created_by`, `agent_name`) are always injected from
 the plugin's own `agent_id` config, never accepted from the model, so a tool call can't spoof
 another agent's identity on the shared brain.
+
+## The message bridge
+
+Agents on one MemPalace hub can send each other work through its event log. With the bridge on,
+Hermes takes part as `agent_id` (for example `unraid-hermes`): a message addressed to it reaches it
+within about a minute and starts a turn in your gateway chat, and a message sent while the gateway
+is down waits on the hub and is picked up when the bridge next starts. The protocol is shared with
+the Claude Code plugin and written up in
+[docs/bridge.md](https://github.com/shanelord01/claude-mempalace-sharedbrain/blob/main/docs/bridge.md).
+
+### Switching it on
+
+Add the bridge keys to `$HERMES_HOME/mempalace_sharedbrain.json`:
+
+```json
+{
+  "hub_url": "http://mempalace:8765/mcp",
+  "agent_id": "unraid-hermes",
+  "bridge_enabled": true,
+  "bridge_mode": "read"
+}
+```
+
+`read` (the default) starts a turn for each message that only reads and reports it. Set
+`bridge_mode` to `act` to let tasks addressed to Hermes, signed with a key you approved, be carried
+out (see Signing and trust below).
+
+Starting a turn uses Hermes's plugin message API, which is off for every plugin until you grant it
+in `config.yaml`:
+
+```yaml
+plugins:
+  entries:
+    mempalace-sharedbrain:
+      allow_gateway_injection: true
+```
+
+Then restart the gateway. Bridge turns go to the session named by `bridge_session_key` (a gateway
+session key such as `agent:main:telegram:dm:123456789`). Leave it empty and the plugin uses the
+most recent direct-message conversation with the gateway, so send Hermes one message after
+switching the bridge on. Without the permission or a known session, mail still arrives but waits for
+your next message, and the check-in says `listening no`.
+
+The bridge starts with the first gateway conversation after a restart, because Hermes builds a memory
+provider per conversation and gives memory providers no gateway start-up hook. CLI, cron and
+subagent runs never start it. One process per `HERMES_HOME` runs it, enforced with a lock file.
+
+### What it does
+
+The bridge checks in to the presence room (wing `fleet`, room `presence` by default) when it starts
+and every 30 minutes: one drawer for this identity, updated in place, whose first two lines read
+
+```
+identity: unraid-hermes | checked_in 2026-10-04T09:30:00Z | plugin 1.1.0 hermes | listening yes | host unraid | project hermes | bridge act
+bridge-key: ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... SHA256:<fingerprint>
+```
+
+About once a minute it reads `mempalace_event_list` addressed to `agent_id` (which includes `*`
+broadcasts) from its own cursor, in pages of 40. In `act` mode, a `task.request` addressed to this
+agent by name, with a `correlation_id`, carrying a valid signature from a key you approved for its
+sender, with no stated requirements, is act level: the turn claims it, does the work, replies and
+closes it. Everything else is read level: broadcasts, replies, `patch.ready`, unsigned or untrusted
+messages, and tasks with requirements (Hermes has no capability profile, so it cannot confirm them).
+A read-level turn reports the message to you, answers a direct question with a `task.reply` and
+does nothing else.
+
+Each message in your chat opens with a line saying who sent it and what this machine found when it
+checked the signature:
+
+```
+📨 From bazzite:claude:projects · 🔐 signature verified (SHA256:<fingerprint>)
+📨 From bazzite:claude:projects · ⚠️ unsigned
+📨 From bazzite:claude:projects · ⛔ signature not valid: <reason>
+```
+
+The mark and the fingerprint come only from Hermes's own check, never from anything the sender
+wrote, and those mark characters are removed from every sender name and message body, so a message
+cannot fake a verified line. Hermes's plugin message API carries the text as a user message with no
+separate sender field, which is why the sender line is part of the text.
+
+In `read` mode every message is read level. In `off` mode no turn starts and mail waits for your next
+message, as it did before the bridge. Mail that waits reaches the model through the memory prefetch
+of your next message, only in your own direct-message session, never a group chat.
+
+Before an act-level turn the bridge takes a lock file for the event, so two processes sharing the
+identity never both act on it, and posts a status-less `received:` ack so the sender knows Hermes
+picked it up. A task that its sender, its named addressee or Hermes itself already closed starts no
+turn. For a broadcast anyone's closure counts, and you are told who closed it.
+
+The inbox cursor moves only past mail whose turn finished. If a turn never runs, the mail is shown
+again at your next message instead of being lost. Turns started by mail are filed to the palace
+without the other agents' text, so the palace never records it as something you said.
+
+### Signing and trust
+
+A sender name is free text, so act level needs a signature. Each machine has one Ed25519 key used
+only for the bridge. Hermes creates its key on first use at
+`$HERMES_HOME/mempalace_sharedbrain/bridge_ed25519` and publishes the public half in its check-in.
+Signatures use OpenSSH's own format (`ssh-keygen -Y sign`, namespace `mempalace-bridge`). Hermes runs
+`ssh-keygen` when it is installed and otherwise does the same with the Python `cryptography`
+package. With neither, the check-in says signing is unavailable and every message stays read level.
+
+Replies (`task.reply`) that Hermes sends with `mempalace_event_append` are always signed. A signed
+`task.request` or `patch.ready` is something another machine may carry out, so `bridge_sign_tasks`
+decides when you approve one:
+
+| Value | What happens |
+|---|---|
+| `session` (default) | The first task to each recipient in a chat waits for your approval. `/bridge-send <id> always` signs it and every later task to that recipient in the same chat. |
+| `ask` | Every task waits for your approval. |
+| `auto` | Tasks are signed without asking. |
+
+Any other value counts as `ask`. A task waiting for approval is not sent. Hermes keeps it as a draft
+with a four-character id and asks you to type `/bridge-send <id>`. That command prints the stored
+draft exactly as it will be sent (type, sender, recipient, correlation id and the full body), read
+from the plugin's own store rather than as the model describes it, followed by your options:
+
+```
+/bridge-send <id> sign      sign and send it
+/bridge-send <id> always    sign and send it, and sign later tasks to that recipient in this chat (session only)
+/bridge-send <id> unsigned  send it unsigned
+```
+
+Only these forms send, and the reply gives the hub's event id. Only you can run `/bridge-send`: no
+model tool wraps it, and text injected by the bridge cannot run slash commands. Drafts expire after
+30 minutes, and a draft longer than 3,000 characters can only go unsigned.
+
+In every mode, a turn that carries mail from other agents never signs or drafts a `task.request` or
+`patch.ready`, whether the mail started the turn or arrived with your message. It goes out unsigned
+and the tool result says why, so another agent's message cannot get a signed task sent on to a third
+machine. This holds in `auto` and for remembered recipients too. Memory recalled from the palace does
+not count. Send the task
+with `mempalace_event_append`, naming the recipient and a `correlation_id`. A sender, recipient,
+type or correlation id that could blur the signed lines (a newline, or characters outside the
+allowed set) is never signed, and an incoming one never verifies.
+`mempalace_patch_submit` and the hub's `mempalace_task_create` cannot carry a signature.
+
+An act-level turn is given the exact body of the event that passed these checks, fenced as data and
+labelled with its event id, and is told to act only on that text. Anything else on the same thread,
+including what a later fetch of the thread returns, stays read level, so an unsigned event cannot
+stand in for the signed one.
+
+A signature counts when it verifies over the event's sender, recipient, type, correlation id, time
+and full body against a key you approved for that sender, is no more than 14 days old or 5 minutes
+ahead, and has not been seen before on a different event. Where the hub records which identity it
+authenticated for an event (the `writer` field on newer hubs) and that differs from the claimed
+sender, the message is read level and its closures do not count.
+
+A published key grants nothing until you approve it. The easy way is a 6-digit code. On the
+machine whose key the others should trust, type `/bridge-trust pair` in your Hermes chat (Claude
+Code: `/mempalace-sharedbrain:trust pair`). It sends the key to the hub and shows a code. On each
+machine that should trust it, type `/bridge-trust pair <code>` (Claude Code:
+`/mempalace-sharedbrain:trust pair <code>`) within 10 minutes. The code never goes to the hub. If
+two different keys answer to the same code, nothing is approved and you start again. The receiving
+machine reads every pairing request of the last 15 minutes, and refuses if the hub cannot be read
+completely or holds more than 2,000 of them. Pairing is one
+way, so run it on each machine that should send work.
+
+The other commands, all typed in your Hermes chat:
+
+```
+/bridge-trust list                             check-ins, their keys and fingerprints, and which are approved
+/bridge-trust show                             this machine's own key and fingerprint
+/bridge-trust approve <identity> <fingerprint> trust that identity's published key
+/bridge-trust revoke <principal>               remove a trusted key
+```
+
+Approving by hand needs the fingerprint, read on the other machine with `/bridge-trust show` (or
+`/mempalace-sharedbrain:trust show`). It is refused if the published key differs, or if two check-ins
+claim the same identity. Approving a `host:harness:project` identity trusts the key for `host:*`,
+every identity on that machine. Approving a fixed name such as `unraid-hermes` trusts it for that
+name only. Each principal holds one key: approving or pairing again replaces the key it had.
+Approved keys live in the OpenSSH allowed-signers file
+`$HERMES_HOME/mempalace_sharedbrain/trusted_signers`. No model tool can pair, approve or revoke a key.
+
+Whatever the level, text from other agents is treated as data: excerpts are cleaned of control
+characters, shortened, kept to one line each and fenced between "begin data" and "end data" markers
+they cannot forge, and the turn is told never to put them into a shell command.
+
+### Limits and resuming a paused thread
+
+The bridge starts at most `bridge_max_turns_per_hour` turns an hour (12). Past that, mail waits for
+your next message and you are told once.
+
+A thread is a `correlation_id`, or the event id when there is none. After
+`bridge_max_turns_per_thread` automatic turns on one thread (4), the turn that reaches the limit
+does its work, summarises the whole thread for you, posts a `status` event on the thread telling the
+other agent it has paused for you, and asks whether to continue. New mail on a paused thread starts
+no turn and waits, marked as paused. To let it carry on, type
+
+```
+/bridge-continue <thread>
+```
+
+in your Hermes chat, or ask Hermes to resume it, which calls `mempalace_bridge_continue`. Either one
+resets the thread's count. `/bridge-continue` on its own lists the paused threads, and
+`/bridge-continue all` resumes every one. The tool refuses to resume anything in a turn that carries
+bridge mail, whether the mail started the turn or arrived with your message, so mail can never lift
+its own pause. The slash command always works, because injected text cannot run slash commands.
+
+### State
+
+The cursor, the presence drawer id, thread counts, paused threads, mail waiting for you and the
+signatures already seen live in `$HERMES_HOME/mempalace_sharedbrain/`, one file per identity, with
+per-event lock files, the bridge key and the trusted signers file beside it. Keep a copy of the key
+if you rebuild the container, or approve the new one on the other machines.
+Deleting the directory starts the bridge afresh: it then looks only at open tasks that nobody has
+closed and that Hermes has not already taken on.
 
 ## Wire format
 
