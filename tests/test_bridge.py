@@ -81,8 +81,13 @@ class FakeHub:
         limit = int(args.get("limit") or 50)
         ids = [e["id"] for e in self.events]
         if args.get("since_event_id"):
+            if args["since_event_id"] not in ids:  # the hub's own answer to an id it does not hold
+                return {"error": f"since_event_id {args['since_event_id']!r} not found"}
             pos = ids.index(args["since_event_id"])
-            rows = [e for e in rows if ids.index(e["id"]) > pos][:limit]
+            rows = [e for e in rows if ids.index(e["id"]) > pos]
+            if args.get("order") == "desc":
+                rows.reverse()
+            rows = rows[:limit]
         else:
             rows = list(reversed(rows))
             if args.get("before_event_id"):
@@ -569,6 +574,70 @@ class SweepSizeTests(BridgeTestCase):
         bridge.poll()
         threads = [a for a in self.hub.calls_to("mempalace_event_list") if a.get("correlation_id") and a.get("since_event_id")]
         self.assertEqual(len(threads), 2)
+
+
+class ReviewFixTests(BridgeTestCase):
+    def test_a_cursor_the_hub_does_not_hold_restarts_from_the_newest_and_says_so(self):
+        self.trust_peer()
+        task = self.task()
+        self.store.update(lambda st: st.update(cursor="evt_gone"))
+        self.bridge().poll()
+        notes = [n for d in self.state()["deliveries"].values() for n in d["notes"]]
+        self.assertTrue(any("is not on this hub" in n for n in notes), notes)
+        self.assertIn(task["id"], "".join(t for t, _ in self.injected))
+        self.assertNotEqual(self.state()["cursor"], "evt_gone")
+
+    def test_an_error_reply_is_an_error_not_an_empty_list(self):
+        self.assertIn("not found", plugin._hub_failure({"error": "since_event_id 'x' not found"}))
+        self.assertEqual(plugin._hub_failure({"events": []}), "")
+
+    def test_a_closure_at_the_end_of_a_long_thread_is_found(self):
+        self.trust_peer()
+        task = self.task(correlation_id="long")
+        for _ in range(130):
+            self.hub.add_event(type="status", from_agent="x:claude:y", to_agent="z", correlation_id="long")
+        self.hub.add_event(type="task.reply", from_agent=PEER, to_agent=ME, status="applied", correlation_id="long")
+        self.bridge().poll()
+        self.assertNotIn(task["id"], "".join(t for t, _ in self.injected))
+
+    def test_a_thread_that_never_reads_releases_its_task_at_read_level(self):
+        self.trust_peer()
+        task = self.task(correlation_id="broken")
+        real = self.hub.t_mempalace_event_list
+
+        def failing(args):
+            if args.get("correlation_id") == "broken" and args.get("since_event_id"):
+                raise plugin._HubError("mempalace_event_list: the reply could not be read (1 characters)")
+            return real(args)
+
+        self.hub.t_mempalace_event_list = failing
+        bridge = self.bridge()
+        for _ in range(plugin._THREAD_TRIES - 1):
+            bridge.poll()
+        self.assertEqual(self.injected, [])
+        bridge.poll()
+        text = "".join(t for t, _ in self.injected)
+        self.assertIn(task["id"], text)
+        self.assertIn("could not be checked for a closure", text)
+        self.assertNotIn("[level act", text)
+
+    def test_check_ins_are_read_in_pages_that_shrink(self):
+        self.hub.checkin(PEER)
+        real = self.hub.t_mempalace_list_drawers
+
+        def cut(args):
+            if args["limit"] > 10:
+                raise plugin._HubError("mempalace_list_drawers: the reply could not be read (90000 characters)")
+            return real(args)
+
+        self.hub.t_mempalace_list_drawers = cut
+        rows = self.bridge()._presence_rows()
+        self.assertEqual([r[1]["identity"] for r in rows], [PEER])
+        self.assertEqual([a["limit"] for a in self.hub.calls_to("mempalace_list_drawers")], [50, 25, 12, 6])
+
+    def test_turn_rules_check_an_artifact_brief_and_the_fix_closes_the_unsigned_original(self):
+        self.assertIn("mempalace_artifact_get", plugin._BRIDGE_RULES)
+        self.assertIn("status=superseded", plugin._LONG_BRIEF_FIX)
 
 
 class LongBriefTests(BridgeTestCase):
