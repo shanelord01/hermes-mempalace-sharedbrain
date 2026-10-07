@@ -37,6 +37,11 @@ class FakeHub:
         event = {"id": f"evt_{self._next:04d}", "status": "", "body": "", "correlation_id": None, "metadata": {}}
         self._next += 1
         event.update(fields)
+        ack_of = (event.get("metadata") or {}).get("ack_of")
+        if event.get("type") == "event.ack" and ack_of and not event.get("correlation_id"):
+            # Like the hub: an ack copies its target's correlation id, or the target's id.
+            target = next((e for e in self.events if e["id"] == ack_of), None)
+            event["correlation_id"] = (target or {}).get("correlation_id") or ack_of
         self.events.append(event)
         return event
 
@@ -73,11 +78,20 @@ class FakeHub:
             rows = [e for e in rows if e.get("from_agent") == args["writer"]]
         if args.get("from_agent"):
             rows = [e for e in rows if e.get("from_agent") == args["from_agent"]]
+        if args.get("since_created_at"):
+            rows = [e for e in rows if (e.get("created_at") or "9999") >= args["since_created_at"]]
         limit = int(args.get("limit") or 50)
         ids = [e["id"] for e in self.events]
         if args.get("since_event_id"):
+            if args["since_event_id"] not in ids:  # the hub's own answer to an id it does not hold
+                return {"error": f"since_event_id {args['since_event_id']!r} not found"}
             pos = ids.index(args["since_event_id"])
-            rows = [e for e in rows if ids.index(e["id"]) > pos][:limit]
+            rows = [e for e in rows if ids.index(e["id"]) > pos]
+            if args.get("order") == "desc":
+                rows.reverse()
+            rows = rows[:limit]
+        elif args.get("order") == "asc":
+            rows = rows[:limit]
         else:
             rows = list(reversed(rows))
             if args.get("before_event_id"):
@@ -518,6 +532,151 @@ class ClosureTests(BridgeTestCase):
             self.assertLessEqual(args["limit"], 40)
 
 
+class SweepSizeTests(BridgeTestCase):
+    def test_no_hub_wide_read_of_acks_or_replies(self):
+        self.trust_peer()
+        self.task()
+        self.bridge().poll()
+        for args in self.hub.calls_to("mempalace_event_list"):
+            self.assertTrue(args.get("to_agent") or args.get("writer") or args.get("from_agent")
+                            or args.get("correlation_id"), args)
+
+    def test_a_closure_is_found_on_the_tasks_own_thread_however_much_else_the_hub_holds(self):
+        self.trust_peer()
+        task = self.task(correlation_id=None)
+        self.hub.add_event(type="event.ack", from_agent=PEER, status="applied", metadata={"ack_of": task["id"]})
+        for _ in range(300):  # other agents' traffic, newer than the closure
+            self.hub.add_event(type="task.reply", from_agent="x:claude:y", to_agent="z", status="applied", correlation_id="other")
+        self.bridge().poll()
+        self.assertEqual(self.injected, [])
+
+    def test_an_unreadable_reply_is_asked_for_again_with_half_the_limit(self):
+        self.trust_peer()
+        self.task()
+        real = self.hub.t_mempalace_event_list
+
+        def cut_short(args):
+            if int(args.get("limit") or 50) > 10:
+                raise plugin._HubError("mempalace_event_list: the reply could not be read (61234 characters)")
+            return real(args)
+
+        self.hub.t_mempalace_event_list = cut_short
+        self.bridge().poll()
+        self.assertEqual(len(self.injected), 1)
+        limits = [a["limit"] for a in self.hub.calls_to("mempalace_event_list")]
+        self.assertEqual(limits[:3], [40, 20, 10])
+
+    def test_tasks_past_the_thread_cap_wait_for_the_next_poll(self):
+        self.trust_peer()
+        for _ in range(plugin._THREAD_CAP + 2):
+            self.task()
+        bridge = self.bridge(max_turns_per_hour=100)
+        bridge.poll()
+        threads = [a for a in self.hub.calls_to("mempalace_event_list") if a.get("correlation_id") and a.get("since_event_id")]
+        self.assertEqual(len(threads), plugin._THREAD_CAP)
+        self.hub.calls.clear()
+        bridge.poll()
+        threads = [a for a in self.hub.calls_to("mempalace_event_list") if a.get("correlation_id") and a.get("since_event_id")]
+        self.assertEqual(len(threads), 2)
+
+
+class ReviewFixTests(BridgeTestCase):
+    def test_a_cursor_the_hub_does_not_hold_restarts_from_the_newest_and_says_so(self):
+        self.trust_peer()
+        task = self.task()
+        self.store.update(lambda st: st.update(cursor="evt_gone"))
+        self.bridge().poll()
+        notes = [n for d in self.state()["deliveries"].values() for n in d["notes"]]
+        self.assertTrue(any("is not on this hub" in n for n in notes), notes)
+        self.assertIn(task["id"], "".join(t for t, _ in self.injected))
+        self.assertNotEqual(self.state()["cursor"], "evt_gone")
+
+    def test_an_error_reply_is_an_error_not_an_empty_list(self):
+        self.assertIn("not found", plugin._hub_failure({"error": "since_event_id 'x' not found"}))
+        self.assertEqual(plugin._hub_failure({"events": []}), "")
+
+    def test_a_closure_at_the_end_of_a_long_thread_is_found(self):
+        self.trust_peer()
+        task = self.task(correlation_id="long")
+        for _ in range(130):
+            self.hub.add_event(type="status", from_agent="x:claude:y", to_agent="z", correlation_id="long")
+        self.hub.add_event(type="task.reply", from_agent=PEER, to_agent=ME, status="applied", correlation_id="long")
+        self.bridge().poll()
+        self.assertNotIn(task["id"], "".join(t for t, _ in self.injected))
+
+    def test_a_thread_that_never_reads_releases_its_task_at_read_level(self):
+        self.trust_peer()
+        task = self.task(correlation_id="broken")
+        real = self.hub.t_mempalace_event_list
+
+        def failing(args):
+            if args.get("correlation_id") == "broken" and args.get("since_event_id"):
+                raise plugin._HubError("mempalace_event_list: the reply could not be read (1 characters)")
+            return real(args)
+
+        self.hub.t_mempalace_event_list = failing
+        bridge = self.bridge()
+        for _ in range(plugin._THREAD_TRIES - 1):
+            bridge.poll()
+        self.assertEqual(self.injected, [])
+        bridge.poll()
+        text = "".join(t for t, _ in self.injected)
+        self.assertIn(task["id"], text)
+        self.assertIn("could not be checked for a closure", text)
+        self.assertNotIn("[level act", text)
+
+    def test_check_ins_are_read_in_pages_that_shrink(self):
+        self.hub.checkin(PEER)
+        real = self.hub.t_mempalace_list_drawers
+
+        def cut(args):
+            if args["limit"] > 10:
+                raise plugin._HubError("mempalace_list_drawers: the reply could not be read (90000 characters)")
+            return real(args)
+
+        self.hub.t_mempalace_list_drawers = cut
+        rows = self.bridge()._presence_rows()
+        self.assertEqual([r[1]["identity"] for r in rows], [PEER])
+        self.assertEqual([a["limit"] for a in self.hub.calls_to("mempalace_list_drawers")], [50, 25, 12, 6])
+
+    def test_turn_rules_check_an_artifact_brief_and_the_fix_closes_the_unsigned_original(self):
+        self.assertIn("mempalace_artifact_get", plugin._BRIDGE_RULES)
+        self.assertIn("status=superseded", plugin._LONG_BRIEF_FIX)
+
+
+class SecondReviewTests(BridgeTestCase):
+    def test_a_lost_cursor_reads_again_from_its_time_and_settles_nothing_unseen(self):
+        self.trust_peer()
+        self.hub.add_event(type="task.reply", from_agent=PEER, to_agent=ME, status="applied",
+                           created_at="2026-10-08T09:40:00Z", body="too old to read again", correlation_id="c-old")
+        self.hub.add_event(type="task.reply", from_agent=PEER, to_agent=ME, status="applied",
+                           created_at="2026-10-08T09:55:00Z", body="reply in the window", correlation_id="c-new")
+        self.store.update(lambda st: st.update(cursor="evt_20261008T100000_dead"))
+        self.bridge().poll()
+        text = "".join(t for t, _ in self.injected)
+        notes = [n for d in self.state()["deliveries"].values() for n in d["notes"]]
+        self.assertIn("reply in the window", text)
+        self.assertNotIn("too old to read again", text)
+        self.assertTrue(any("from 2026-10-08T09:50:00Z on" in n for n in notes), notes)
+        lists = self.hub.calls_to("mempalace_event_list")
+        self.assertTrue(any(a.get("since_created_at") == "2026-10-08T09:50:00Z" for a in lists))
+
+    def test_offset_paging_that_repeats_a_drawer_keeps_it_once(self):
+        self.hub.checkin(PEER)
+        rows = plugin._list_drawers_paged(lambda tool, args: {"drawers": [{"drawer_id": "d1", "content_preview": "x"}] * args["limit"]},
+                                          "fleet", "presence")
+        self.assertEqual([d["drawer_id"] for d in rows], ["d1"])
+
+
+class LongBriefTests(BridgeTestCase):
+    def test_a_draft_too_long_to_sign_tells_the_model_how_to_send_it_signed(self):
+        bridge = make_provider(self.home)
+        reply = bridge._make_draft({"type": "task.request", "to_agent": PEER, "body": "x" * 3500})
+        self.assertIn("mempalace_artifact_put", reply["too_long_to_sign"])
+        self.assertIn("sha256", reply["too_long_to_sign"])
+        self.assertNotIn("too_long_to_sign", bridge._make_draft({"type": "task.request", "to_agent": PEER, "body": "short"}))
+
+
 class LimitTests(BridgeTestCase):
     def test_hourly_limit_holds_mail_and_says_so_once(self):
         self.trust_peer()
@@ -622,10 +781,10 @@ class HubReadingTests(BridgeTestCase):
     def test_writer_filter_falls_back_to_from_agent_and_is_remembered(self):
         self.hub.supports_writer = False
         bridge = self.bridge()
-        bridge._own_events()
+        bridge._own_acks()
         self.assertEqual(self.state()["own_filter"], "from_agent")
         self.hub.calls.clear()
-        bridge._own_events()
+        bridge._own_acks()
         self.assertFalse(any("writer" in a for a in self.hub.calls_to("mempalace_event_list")))
 
     def test_first_run_skips_tasks_this_identity_already_took(self):
