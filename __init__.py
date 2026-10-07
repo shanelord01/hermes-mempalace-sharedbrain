@@ -412,6 +412,13 @@ _DEFAULT_SIGN_MODE = "session"
 _APPROVAL_TYPES = {"task.request", "patch.ready"}
 _DRAFT_TTL_SECONDS = 30 * 60
 _DRAFT_SIGN_MAX_BODY = 3000
+# How to send a brief too long to sign so that it is still carried out (docs/bridge.md, Long briefs).
+_LONG_BRIEF_FIX = (
+    "Put the full brief in a hub artifact (mempalace_artifact_put, kind note), then send a short task "
+    f"(under {_DRAFT_SIGN_MAX_BODY} characters) that names the artifact id and its sha256 and tells the worker to "
+    "fetch it with mempalace_artifact_get and check the sha256 before acting. The short task is signed, and the "
+    "sha256 in it binds the brief."
+)
 _BRIDGE_TURN_NOTE = (
     "sent unsigned: this turn carries mail from other agents (it was started by bridge mail, or mail "
     "arrived with the person's message), and such a turn never signs a task; it will be read only there"
@@ -454,7 +461,7 @@ _BRIDGE_TOOL_NAMES = {schema["name"] for schema in _BRIDGE_TOOL_SCHEMAS}
 # turn confirmed, so a dropped delivery is shown again rather than lost.
 # ---------------------------------------------------------------------------
 
-_PLUGIN_VERSION = "1.2.1"
+_PLUGIN_VERSION = "1.2.2"
 _PLUGIN_KIND = "hermes"
 _BRIDGE_MARKER = "[mempalace bridge]"
 _BRIDGE_MARKER_RE = re.compile(r"^\[mempalace bridge\] delivery (d[0-9a-f]{6,32})", re.MULTILINE)
@@ -469,6 +476,9 @@ _DEFAULT_MAX_TURNS_PER_THREAD = 4
 _BRIDGE_POLL_SECONDS = 60
 _EVENT_PAGE = 40  # one large reply can be cut short in transit, so read in pages
 _MAX_PAGES = 10
+# Task threads read per poll to find closures. A task past this waits for the next poll.
+_THREAD_CAP = 6
+_THREAD_PAGES = 3
 _LOCK_STALE_SECONDS = 6 * 3600
 _REDELIVER_AFTER_SECONDS = 20 * 60
 _EXCERPT_CHARS = 300
@@ -1819,21 +1829,39 @@ class _Bridge:
 
     # -- reading the hub ------------------------------------------------------
 
-    def _events(self, args: Dict[str, Any]) -> List[Dict[str, Any]]:
-        data = self.call("mempalace_event_list", dict({"preview": True}, **args))
-        if not isinstance(data, dict) or not isinstance(data.get("events"), list):
-            raise _HubError("mempalace_event_list: reply has no events list")
-        return [e for e in data["events"] if isinstance(e, dict)]
+    def _event_page(self, args: Dict[str, Any]) -> Tuple[List[Dict[str, Any]], int]:
+        """One mempalace_event_list call, and the limit that answered. A reply that
+        arrives cut short (unreadable) is asked for again with half the limit, down to
+        one event, before it fails: a page's size follows its events, and a preview
+        still carries each event's envelope and signature."""
+        limit = max(1, int(args.get("limit") or _EVENT_PAGE))
+        while True:
+            try:
+                data = self.call("mempalace_event_list", dict({"preview": True}, **dict(args, limit=limit)))
+            except _HubError as exc:
+                if "could not be read" not in str(exc) or limit <= 1:
+                    raise
+                limit = max(1, limit // 2)
+                logger.info("mempalace_sharedbrain: %s; asking again for %d", exc, limit)
+                continue
+            if not isinstance(data, dict) or not isinstance(data.get("events"), list):
+                raise _HubError("mempalace_event_list: reply has no events list")
+            return [e for e in data["events"] if isinstance(e, dict)], limit
 
-    def _events_since(self, cursor: str) -> List[Dict[str, Any]]:
-        """Chronological events after `cursor`, in pages of 40 (no `order`: a resume
-        from a cursor is chronological on the hub)."""
+    def _events(self, args: Dict[str, Any]) -> List[Dict[str, Any]]:
+        return self._event_page(args)[0]
+
+    def _events_since(self, cursor: str, args: Optional[Dict[str, Any]] = None,
+                      pages: int = _MAX_PAGES) -> List[Dict[str, Any]]:
+        """Chronological events after `cursor` matching `args` (this identity's inbox
+        by default), in pages of 40 (no `order`: a resume from a cursor is chronological
+        on the hub)."""
         out: List[Dict[str, Any]] = []
         since = cursor
-        for _ in range(_MAX_PAGES):
-            page = self._events({"to_agent": self.me, "since_event_id": since, "limit": _EVENT_PAGE})
+        for _ in range(pages):
+            page, limit = self._event_page(dict(args or {"to_agent": self.me}, since_event_id=since, limit=_EVENT_PAGE))
             out.extend(page)
-            if len(page) < _EVENT_PAGE or not page[-1].get("id"):
+            if len(page) < limit or not page or not page[-1].get("id"):
                 break
             since = str(page[-1]["id"])
         return out
@@ -1846,36 +1874,58 @@ class _Bridge:
             page_args = dict(args, limit=min(_EVENT_PAGE, total - len(out)))
             if before:
                 page_args["before_event_id"] = before
-            page = self._events(page_args)
+            page, limit = self._event_page(page_args)
             if not page:
                 break
             out.extend(page)
             before = str(page[-1].get("id") or "")
-            if not before or len(page) < page_args["limit"]:
+            if not before or len(page) < limit:
                 break
         return out
 
-    def _own_events(self) -> List[Dict[str, Any]]:
-        """This identity's own events. Newer hubs filter with `writer`; 3.10 rejects it
-        and takes `from_agent`. The one that works is remembered."""
+    def _own_acks(self) -> List[Dict[str, Any]]:
+        """This identity's own recent acks. Newer hubs filter with `writer`; 3.10 rejects
+        it and takes `from_agent`. The one that works is remembered, and only a refusal
+        of the parameter teaches it: on 3.11 `from_agent` does not filter at all, so a
+        timeout or an unreadable reply must not switch to it."""
+        mine = lambda got: [e for e in got if (e.get("writer") or e.get("from_agent")) == self.me]  # noqa: E731
         known = self.state.read().get("own_filter") or ""
         if known:
-            return self._recent({known: self.me}, 120)
+            return mine(self._recent({known: self.me, "type": "event.ack"}, _EVENT_PAGE))
         try:
-            got = self._recent({"writer": self.me}, 120)
+            got = self._recent({"writer": self.me, "type": "event.ack"}, _EVENT_PAGE)
             chosen = "writer"
-        except _HubError:
-            got = self._recent({"from_agent": self.me}, 120)
+        except _HubError as exc:
+            if "writer" not in str(exc):
+                raise
+            got = self._recent({"from_agent": self.me, "type": "event.ack"}, _EVENT_PAGE)
             chosen = "from_agent"
 
         def apply(state):
             state["own_filter"] = chosen
 
         self.state.update(apply)
-        return got
+        return mine(got)
 
-    def _closers(self) -> List[Dict[str, Any]]:
-        return self._recent({"type": "event.ack"}, 120) + self._recent({"type": "task.reply"}, 120)
+    def _threads_of(self, tasks: List[Dict[str, Any]]) -> Tuple[Dict[str, List[Dict[str, Any]]], List[Dict[str, Any]]]:
+        """Each task's own thread, read forward from the task: an ack copies the task's
+        correlation id (or its id when it has none), so its closure is there, and nothing
+        before a task can close it. At most _THREAD_CAP threads; returns the events by
+        task id, and the tasks whose thread was not read (past the cap, or unreadable)."""
+        threads: Dict[str, List[Dict[str, Any]]] = {}
+        unread: List[Dict[str, Any]] = []
+        for task in tasks:
+            tid = str(task.get("id") or "")
+            if len(threads) >= _THREAD_CAP:
+                unread.append(task)
+                continue
+            key = str(task.get("correlation_id") or tid)
+            try:
+                threads[tid] = self._events_since(tid, {"correlation_id": key}, _THREAD_PAGES)
+            except _HubError as exc:
+                logger.info("mempalace_sharedbrain: thread %s unreadable: %s", _clean(key, 100), exc)
+                unread.append(task)
+        return threads, unread
 
     # -- the poll -------------------------------------------------------------
 
@@ -1929,17 +1979,26 @@ class _Bridge:
         newly_reported: List[str] = []
         tasks = [e for e in mail if e.get("type") == "task.request"]
         if tasks:
-            closers = self._closers()
+            # Closures come from each task's own thread, never from a hub-wide list of acks
+            # and replies, whose size grows with everyone's traffic. A task whose thread was
+            # not read this poll is held: not delivered, not settled, read by the next poll.
+            threads, unread = self._threads_of(tasks)
+            for task in unread:
+                mail.remove(task)
+            if unread:
+                logger.info("mempalace_sharedbrain: %d task thread(s) left for the next poll", len(unread))
             taken = set()
+            own = [e for evts in threads.values() for e in evts if (e.get("writer") or e.get("from_agent")) == self.me]
             if first_run:
-                for own in self._own_events():
-                    # A status-less ack is a receipt, not taking the task on.
-                    if own.get("type") == "event.ack" and str(own.get("status") or ""):
-                        taken.add(str(_metadata(own).get("ack_of") or ""))
+                own += self._own_acks()
+            for event in own:
+                # A status-less ack is a receipt, not taking the task on.
+                if event.get("type") == "event.ack" and str(event.get("status") or ""):
+                    taken.add(str(_metadata(event).get("ack_of") or ""))
             reported = set(state["closures_reported"])
-            for task in tasks:
+            for task in [t for t in tasks if str(t.get("id")) in threads]:
                 tid = str(task.get("id"))
-                closure = _closure_for(task, closers, self.me)
+                closure = _closure_for(task, threads[tid], self.me)
                 if closure is not None or tid in taken:
                     settled.add(tid)
                     mail.remove(task)
@@ -2066,13 +2125,15 @@ class _Bridge:
         corr = str(event.get("correlation_id") or "")
         if not corr:
             return event
-        if corr not in cache:
+        # Full bodies can be long: the read is narrowed to the event's type on its thread.
+        key = corr + "\n" + str(event.get("type") or "")
+        if key not in cache:
             try:
-                cache[corr] = self._recent({"correlation_id": corr, "preview": False}, 200)
+                cache[key] = self._recent({"correlation_id": corr, "type": event.get("type"), "preview": False}, _EVENT_PAGE)
             except _HubError:
                 logger.info("mempalace_sharedbrain: full event for %s unreadable", corr)
-                cache[corr] = []
-        for full in cache[corr]:
+                cache[key] = []
+        for full in cache[key]:
             if str(full.get("id")) == str(event.get("id")):
                 return full
         return event
@@ -2400,7 +2461,8 @@ def _bridge_send_text(raw_args: str, *, store: "_BridgeState", signer: "_Signer"
     if signed and len(body) > _DRAFT_SIGN_MAX_BODY:
         store.update(lambda st: st["drafts"].__setitem__(draft_id, draft))
         return (f"Refused: the text is over {_DRAFT_SIGN_MAX_BODY} characters, too long to sign. Type "
-                f"/bridge-send {draft_id} unsigned to send it unsigned. Nothing sent.")
+                f"/bridge-send {draft_id} unsigned to send it unsigned (read only there). Nothing sent. "
+                f"To have it carried out instead: {_LONG_BRIEF_FIX}")
     args["from_agent"] = me
     if signed:
         try:
@@ -2454,7 +2516,8 @@ def _draft_view(store: "_BridgeState", draft_id: str, me: str, now: float) -> st
         "",
     ]
     if len(body) > _DRAFT_SIGN_MAX_BODY:
-        lines.append(f"The body is over {_DRAFT_SIGN_MAX_BODY} characters, so it can only go unsigned.")
+        lines.append(f"The body is over {_DRAFT_SIGN_MAX_BODY} characters, so it can only go unsigned. "
+                     f"To have it carried out, ask for it to be sent the short way: {_LONG_BRIEF_FIX}")
     else:
         lines.append(f"/bridge-send {draft_id} sign      sign and send it")
         if draft.get("mode") == "session":
@@ -3342,7 +3405,7 @@ class MempalaceSharedBrainProvider(MemoryProvider):
             return draft_id
 
         draft_id = self._bridge_store().update(store)
-        return {
+        reply = {
             "status": "not sent: waiting for the person",
             "draft": draft_id,
             "instructions": (
@@ -3352,6 +3415,13 @@ class MempalaceSharedBrainProvider(MemoryProvider):
                 f"{_DRAFT_TTL_SECONDS // 60} minutes."
             ),
         }
+        length = len(str(args.get("body") or ""))
+        if length > _DRAFT_SIGN_MAX_BODY:
+            reply["too_long_to_sign"] = (
+                f"The body is {length} characters, over the {_DRAFT_SIGN_MAX_BODY} that can be signed, so this draft "
+                f"can only go unsigned and will only be read there. {_LONG_BRIEF_FIX} Tell the person this."
+            )
+        return reply
 
     def _signer(self) -> _Signer:
         return _Signer(self._hermes_home or self._current_hermes_home(), self._agent_id)

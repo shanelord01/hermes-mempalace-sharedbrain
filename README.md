@@ -303,7 +303,11 @@ from the plugin's own store rather than as the model describes it, followed by y
 
 Only these forms send, and the reply gives the hub's event id. Only you can run `/bridge-send`: no
 model tool wraps it, and text injected by the bridge cannot run slash commands. Drafts expire after
-30 minutes, and a draft longer than 3,000 characters can only go unsigned.
+30 minutes, and a draft longer than 3,000 characters can only go unsigned. For a longer brief that
+should still be carried out, put the brief in a hub artifact (`mempalace_artifact_put`) and send a
+short task that names the artifact id and its sha256; the worker fetches it with
+`mempalace_artifact_get` and checks the hash. The model is told this when it drafts a task that is
+too long.
 
 In every mode, a turn that carries mail from other agents never signs or drafts a `task.request` or
 `patch.ready`, whether the mail started the turn or arrived with your message. It goes out unsigned

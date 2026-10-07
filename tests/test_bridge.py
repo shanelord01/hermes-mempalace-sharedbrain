@@ -37,6 +37,11 @@ class FakeHub:
         event = {"id": f"evt_{self._next:04d}", "status": "", "body": "", "correlation_id": None, "metadata": {}}
         self._next += 1
         event.update(fields)
+        ack_of = (event.get("metadata") or {}).get("ack_of")
+        if event.get("type") == "event.ack" and ack_of and not event.get("correlation_id"):
+            # Like the hub: an ack copies its target's correlation id, or the target's id.
+            target = next((e for e in self.events if e["id"] == ack_of), None)
+            event["correlation_id"] = (target or {}).get("correlation_id") or ack_of
         self.events.append(event)
         return event
 
@@ -518,6 +523,63 @@ class ClosureTests(BridgeTestCase):
             self.assertLessEqual(args["limit"], 40)
 
 
+class SweepSizeTests(BridgeTestCase):
+    def test_no_hub_wide_read_of_acks_or_replies(self):
+        self.trust_peer()
+        self.task()
+        self.bridge().poll()
+        for args in self.hub.calls_to("mempalace_event_list"):
+            self.assertTrue(args.get("to_agent") or args.get("writer") or args.get("from_agent")
+                            or args.get("correlation_id"), args)
+
+    def test_a_closure_is_found_on_the_tasks_own_thread_however_much_else_the_hub_holds(self):
+        self.trust_peer()
+        task = self.task(correlation_id=None)
+        self.hub.add_event(type="event.ack", from_agent=PEER, status="applied", metadata={"ack_of": task["id"]})
+        for _ in range(300):  # other agents' traffic, newer than the closure
+            self.hub.add_event(type="task.reply", from_agent="x:claude:y", to_agent="z", status="applied", correlation_id="other")
+        self.bridge().poll()
+        self.assertEqual(self.injected, [])
+
+    def test_an_unreadable_reply_is_asked_for_again_with_half_the_limit(self):
+        self.trust_peer()
+        self.task()
+        real = self.hub.t_mempalace_event_list
+
+        def cut_short(args):
+            if int(args.get("limit") or 50) > 10:
+                raise plugin._HubError("mempalace_event_list: the reply could not be read (61234 characters)")
+            return real(args)
+
+        self.hub.t_mempalace_event_list = cut_short
+        self.bridge().poll()
+        self.assertEqual(len(self.injected), 1)
+        limits = [a["limit"] for a in self.hub.calls_to("mempalace_event_list")]
+        self.assertEqual(limits[:3], [40, 20, 10])
+
+    def test_tasks_past_the_thread_cap_wait_for_the_next_poll(self):
+        self.trust_peer()
+        for _ in range(plugin._THREAD_CAP + 2):
+            self.task()
+        bridge = self.bridge(max_turns_per_hour=100)
+        bridge.poll()
+        threads = [a for a in self.hub.calls_to("mempalace_event_list") if a.get("correlation_id") and a.get("since_event_id")]
+        self.assertEqual(len(threads), plugin._THREAD_CAP)
+        self.hub.calls.clear()
+        bridge.poll()
+        threads = [a for a in self.hub.calls_to("mempalace_event_list") if a.get("correlation_id") and a.get("since_event_id")]
+        self.assertEqual(len(threads), 2)
+
+
+class LongBriefTests(BridgeTestCase):
+    def test_a_draft_too_long_to_sign_tells_the_model_how_to_send_it_signed(self):
+        bridge = make_provider(self.home)
+        reply = bridge._make_draft({"type": "task.request", "to_agent": PEER, "body": "x" * 3500})
+        self.assertIn("mempalace_artifact_put", reply["too_long_to_sign"])
+        self.assertIn("sha256", reply["too_long_to_sign"])
+        self.assertNotIn("too_long_to_sign", bridge._make_draft({"type": "task.request", "to_agent": PEER, "body": "short"}))
+
+
 class LimitTests(BridgeTestCase):
     def test_hourly_limit_holds_mail_and_says_so_once(self):
         self.trust_peer()
@@ -622,10 +684,10 @@ class HubReadingTests(BridgeTestCase):
     def test_writer_filter_falls_back_to_from_agent_and_is_remembered(self):
         self.hub.supports_writer = False
         bridge = self.bridge()
-        bridge._own_events()
+        bridge._own_acks()
         self.assertEqual(self.state()["own_filter"], "from_agent")
         self.hub.calls.clear()
-        bridge._own_events()
+        bridge._own_acks()
         self.assertFalse(any("writer" in a for a in self.hub.calls_to("mempalace_event_list")))
 
     def test_first_run_skips_tasks_this_identity_already_took(self):
