@@ -78,6 +78,8 @@ class FakeHub:
             rows = [e for e in rows if e.get("from_agent") == args["writer"]]
         if args.get("from_agent"):
             rows = [e for e in rows if e.get("from_agent") == args["from_agent"]]
+        if args.get("since_created_at"):
+            rows = [e for e in rows if (e.get("created_at") or "9999") >= args["since_created_at"]]
         limit = int(args.get("limit") or 50)
         ids = [e["id"] for e in self.events]
         if args.get("since_event_id"):
@@ -87,6 +89,8 @@ class FakeHub:
             rows = [e for e in rows if ids.index(e["id"]) > pos]
             if args.get("order") == "desc":
                 rows.reverse()
+            rows = rows[:limit]
+        elif args.get("order") == "asc":
             rows = rows[:limit]
         else:
             rows = list(reversed(rows))
@@ -638,6 +642,30 @@ class ReviewFixTests(BridgeTestCase):
     def test_turn_rules_check_an_artifact_brief_and_the_fix_closes_the_unsigned_original(self):
         self.assertIn("mempalace_artifact_get", plugin._BRIDGE_RULES)
         self.assertIn("status=superseded", plugin._LONG_BRIEF_FIX)
+
+
+class SecondReviewTests(BridgeTestCase):
+    def test_a_lost_cursor_reads_again_from_its_time_and_settles_nothing_unseen(self):
+        self.trust_peer()
+        self.hub.add_event(type="task.reply", from_agent=PEER, to_agent=ME, status="applied",
+                           created_at="2026-10-08T09:40:00Z", body="too old to read again", correlation_id="c-old")
+        self.hub.add_event(type="task.reply", from_agent=PEER, to_agent=ME, status="applied",
+                           created_at="2026-10-08T09:55:00Z", body="reply in the window", correlation_id="c-new")
+        self.store.update(lambda st: st.update(cursor="evt_20261008T100000_dead"))
+        self.bridge().poll()
+        text = "".join(t for t, _ in self.injected)
+        notes = [n for d in self.state()["deliveries"].values() for n in d["notes"]]
+        self.assertIn("reply in the window", text)
+        self.assertNotIn("too old to read again", text)
+        self.assertTrue(any("from 2026-10-08T09:50:00Z on" in n for n in notes), notes)
+        lists = self.hub.calls_to("mempalace_event_list")
+        self.assertTrue(any(a.get("since_created_at") == "2026-10-08T09:50:00Z" for a in lists))
+
+    def test_offset_paging_that_repeats_a_drawer_keeps_it_once(self):
+        self.hub.checkin(PEER)
+        rows = plugin._list_drawers_paged(lambda tool, args: {"drawers": [{"drawer_id": "d1", "content_preview": "x"}] * args["limit"]},
+                                          "fleet", "presence")
+        self.assertEqual([d["drawer_id"] for d in rows], ["d1"])
 
 
 class LongBriefTests(BridgeTestCase):
