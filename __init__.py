@@ -462,7 +462,7 @@ _BRIDGE_TOOL_NAMES = {schema["name"] for schema in _BRIDGE_TOOL_SCHEMAS}
 # turn confirmed, so a dropped delivery is shown again rather than lost.
 # ---------------------------------------------------------------------------
 
-_PLUGIN_VERSION = "1.2.3"
+_PLUGIN_VERSION = "1.2.4"
 _PLUGIN_KIND = "hermes"
 _BRIDGE_MARKER = "[mempalace bridge]"
 _BRIDGE_MARKER_RE = re.compile(r"^\[mempalace bridge\] delivery (d[0-9a-f]{6,32})", re.MULTILINE)
@@ -3025,6 +3025,10 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         self._enable_kg_write = False
         self._enable_coordination = False
         self._active = False
+        # Explicit tool calls are allowed wherever the model is doing real work, cron
+        # included. Only the memory-flush agent is denied. _active stays narrower: it gates
+        # the automatic turn capture, recall prefetch and the bridge.
+        self._tools_active = False
         # Bridge settings (docs/bridge.md), all off unless bridge_enabled is true.
         self._bridge_enabled = False
         self._sign_mode = _DEFAULT_SIGN_MODE
@@ -3141,6 +3145,9 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         # Cron/flush turns are system-generated; writing them would corrupt the
         # shared representation of what the user actually said and decided.
         self._active = kwargs.get("agent_context") not in {"cron", "flush"} and kwargs.get("platform") != "cron"
+        # A cron job's own deliberate tool calls (search the palace, file the run's outcome)
+        # are not turn capture, so they stay available there. A flush agent gets none.
+        self._tools_active = kwargs.get("agent_context") != "flush" and kwargs.get("platform") != "flush"
         if not self._active:
             return
         self._worker = _spawn_thread(self._writer_loop, "mempalace-sharedbrain-writer")
@@ -3224,7 +3231,7 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         self._bridge_store().update(apply)
 
     def system_prompt_block(self) -> str:
-        if not self._active:
+        if not (self._active or self._tools_active):
             return ""
         return (
             f"You share a MemPalace hub with other agents/machines (your identity: "
@@ -3389,8 +3396,8 @@ class MempalaceSharedBrainProvider(MemoryProvider):
         return out
 
     def _handle_tool_call(self, tool_name: str, args: Dict[str, Any]) -> str:
-        if not self._active:
-            return json.dumps({"error": "mempalace-sharedbrain not active (cron/flush context)."})
+        if not (self._active or self._tools_active):
+            return json.dumps({"error": "mempalace-sharedbrain not active (flush context or not initialised)."})
         if not self._hub_url or not self._token:
             return json.dumps({"error": "mempalace-sharedbrain not configured (missing hub_url or token)."})
         if tool_name == "mempalace_search":
